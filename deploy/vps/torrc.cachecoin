@@ -1,0 +1,14 @@
+# CacheCoin: lines appended to /etc/tor/torrc by deploy/vps/setup_vps.sh
+# cachecoind creates its own onion service through the control port
+# (-listenonion) and authenticates with Tor's cookie file, which the
+# "cachecoin" user can read because it is in the debian-tor group.
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+# DataDirectoryGroupReadable deliberately OFF: the node only needs the control
+# cookie (above), not the other HiddenServiceDir private keys in /var/lib/tor.
+# Client-only hardening for a node that never relays Tor traffic itself.
+SocksPort 127.0.0.1:9050
+SocksPolicy accept 127.0.0.0/8,reject *
+ClientOnly 1
+SafeLogging 1

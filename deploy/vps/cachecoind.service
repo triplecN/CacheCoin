@@ -1,0 +1,91 @@
+# CacheCoin daemon as a systemd service (installed to /etc/systemd/system/).
+# Based on Bitcoin Core's contrib/init/bitcoind.service.
+#
+#   datadir : /var/lib/cachecoind   (chain, onion key, RPC .cookie)
+#   config  : /etc/cachecoin/cachecoin.conf
+#   user    : cachecoin (member of debian-tor for Tor control access)
+
+[Unit]
+Description=CacheCoin daemon (seed/relay node)
+Documentation=https://github.com/bitcoin/bitcoin/blob/master/doc/init.md
+After=network-online.target tor.service
+Wants=network-online.target tor.service
+
+[Service]
+# The log goes to the systemd journal (journalctl -u cachecoind) instead of a
+# debug.log file: journald rate-limits and caps its disk use, so a peer that makes
+# the node log a lot cannot fill a small VPS disk.
+ExecStart=/usr/local/bin/cachecoind -pid=/run/cachecoind/cachecoind.pid \
+                                    -conf=/etc/cachecoin/cachecoin.conf \
+                                    -datadir=/var/lib/cachecoind \
+                                    -printtoconsole -nodebuglogfile \
+                                    -startupnotify='systemd-notify --ready' \
+                                    -shutdownnotify='systemd-notify --stopping'
+
+# Make sure the config directory is readable by the service user ("+": this one
+# command runs as root; replaces the deprecated PermissionsStartOnly=true)
+ExecStartPre=+/bin/chgrp cachecoin /etc/cachecoin
+
+Type=notify
+NotifyAccess=all
+PIDFile=/run/cachecoind/cachecoind.pid
+
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# READY is sent after initialization, before initial block download, so this only
+# has to cover start-up. A finite value means a daemon that never becomes ready
+# is restarted instead of sitting in "activating" forever.
+TimeoutStartSec=900
+TimeoutStopSec=600
+
+User=cachecoin
+Group=cachecoin
+SupplementaryGroups=debian-tor
+
+RuntimeDirectory=cachecoind
+RuntimeDirectoryMode=0710
+ConfigurationDirectory=cachecoin
+ConfigurationDirectoryMode=0710
+StateDirectory=cachecoind
+StateDirectoryMode=0710
+
+# Hardening
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateDevices=true
+# New files (wallets, onion key, debug output) are created owner-only, so a
+# misconfigured umask elsewhere cannot leave secrets world-readable.
+UMask=0077
+# No capabilities needed past startup (runs as User=cachecoin already).
+CapabilityBoundingSet=
+# Kernel attack surface off: tunables, module loading, cgroup writes.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+# Namespace / realtime / setuid execution off; native syscalls only.
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+# File-descriptor ceiling: bounds a connection/file flood without touching
+# memory limits (no MemoryMax: the node legitimately grows dbcache/mempool).
+LimitNOFILE=4096
+# Sockets: local (systemd notify), IPv4/IPv6 (Tor and RPC on localhost) and netlink
+# (glibc address lookups). Raw packet sockets and other families are refused.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Bitcoin Core's unit also sets MemoryDenyWriteExecute=true. It is left out on
+# purpose: RandomX compiles its programs to machine code at runtime (JIT). The JIT
+# pages are never writable and executable at the same time (W^X), but they do
+# become executable after being written, which MemoryDenyWriteExecute forbids.
+# With MemoryDenyWriteExecute=true cachecoind detects this at startup and uses
+# the RandomX interpreter instead (identical hashes, about 6-7x slower: roughly
+# 135 ms instead of 20 ms per header on a typical desktop CPU). The startup log
+# says which mode is in use ("RandomX proof-of-work: ...").
+
+[Install]
+WantedBy=multi-user.target
