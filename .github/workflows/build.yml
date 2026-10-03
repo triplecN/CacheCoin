@@ -3,8 +3,9 @@ name: build-and-test
 # The Linux job mirrors
 # scripts/build_linux.sh + tests/ one-to-one. The ARM64 job repeats the consensus
 # suites there, because RandomX has separate ARM64 code paths and consensus must
-# not depend on the architecture. The Windows job exists so newcomers can download
-# a ready .exe from Releases instead of building (see START_HERE.md). Checksums are
+# not depend on the architecture. The Windows job builds the .exe files so a
+# release can attach them when it chooses to (release.yml decides what is
+# attached; the Windows binaries stay outside the Linux suites). Checksums are
 # SHA-256 (never MD5: MD5 is broken for integrity purposes).
 
 on:
@@ -91,10 +92,9 @@ jobs:
     # from scripts/build_linux.sh: pin check -> apply the patch series in order ->
     # build pinned RandomX -> build node binaries -> SHA256SUMS.
     #
-    # Allowed to fail for now: the MSYS2/MINGW64 toolchain is the least
-    # reliable of the three jobs, and a red Windows job must not mark the
-    # whole run as failed. Remove continue-on-error once it is green.
-    continue-on-error: true
+    # Required, like the Linux jobs: the Windows binaries are a release input,
+    # and a red Windows job must fail the run. The artifact is only uploaded
+    # when the build, the regtest smoke test and the DLL collection all pass.
     runs-on: windows-2022
     defaults:
       run:
@@ -108,10 +108,9 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            git mingw-w64-x86_64-toolchain
+            git make mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake mingw-w64-x86_64-boost
             mingw-w64-x86_64-libevent mingw-w64-x86_64-sqlite3
-            mingw-w64-x86_64-natpmp
             mingw-w64-x86_64-zeromq python
       - name: Clone pinned sources
         run: |
@@ -145,7 +144,7 @@ jobs:
           mkdir -p /c/b/src/crypto/randomx/build
           cd /c/b/src/crypto/randomx/build
           cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
-          make -j4
+          cmake --build . -j4
           ./randomx-tests > randomx-tests.log && tail -1 randomx-tests.log
           cd /c/b
           cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
@@ -153,13 +152,59 @@ jobs:
             -DBUILD_KERNEL_LIB=OFF -DBUILD_BITCOIN_BIN=OFF -DENABLE_WALLET=ON \
             -DENABLE_IPC=OFF -DWITH_ZMQ=OFF -DWITH_USDT=OFF
           cmake --build build -j4 --target bitcoind bitcoin-cli
-      - name: Rename, checksum, upload
+      - name: Smoke test (start the node, mine a regtest block)
+        # The Linux suites cannot run these binaries, so this is the only
+        # automated check that the Windows build starts, passes the RandomX
+        # self-test, reports the CacheCoin genesis and can mine. Regtest only:
+        # no network, no mainnet, throw-away datadir.
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/release"
-          cp /c/b/build/bin/bitcoind.exe "$GITHUB_WORKSPACE/release/cachecoind.exe"
-          cp /c/b/build/bin/bitcoin-cli.exe "$GITHUB_WORKSPACE/release/cachecoin-cli.exe"
-          cd "$GITHUB_WORKSPACE/release"
-          sha256sum cachecoind.exe cachecoin-cli.exe > SHA256SUMS.txt
+          cd /c/b
+          ./build/bin/bitcoind.exe --version
+          D="$(mktemp -d)"
+          CLI="./build/bin/bitcoin-cli.exe -regtest -datadir=$D -rpcuser=u -rpcpassword=p -rpcport=39932"
+          ./build/bin/bitcoind.exe -regtest -datadir="$D" -rpcuser=u -rpcpassword=p \
+              -rpcport=39932 -port=39933 -listen=0 -printtoconsole=0 &
+          BPID=$!
+          for i in $(seq 1 60); do
+            $CLI getblockchaininfo >/dev/null 2>&1 && break
+            sleep 2
+          done
+          GENESIS="$($CLI getblockhash 0)"
+          echo "genesis: $GENESIS"
+          # Regtest keeps Bitcoin's regtest genesis (patch 0002 only replaces the
+          # mainnet one); 1bc3387d... is the mainnet genesis, checked elsewhere.
+          test "$GENESIS" = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+          $CLI createwallet w
+          ADDR="$($CLI -rpcwallet=w getnewaddress "" bech32)"
+          $CLI -rpcwallet=w generatetoaddress 1 "$ADDR"
+          H="$($CLI getblockcount)"
+          echo "regtest height: $H"
+          test "$H" = "1"
+          $CLI stop
+          wait $BPID || true
+          rm -rf "$D"
+      - name: Rename, collect runtime DLLs, checksum, upload
+        # The MSYS2/MINGW64 build is dynamically linked, so the artifact carries
+        # the MinGW runtime and library DLLs next to the executables. Windows
+        # searches the application directory first, so the package runs on a
+        # machine that has never seen MSYS2. objdump lists the imported DLLs
+        # (ldd is not installed in this environment); only names that exist in
+        # /mingw64/bin are copied, so system DLLs are never shipped.
+        run: |
+          BIN="$GITHUB_WORKSPACE/release/bin"
+          mkdir -p "$BIN"
+          cp /c/b/build/bin/bitcoind.exe "$BIN/cachecoind.exe"
+          cp /c/b/build/bin/bitcoin-cli.exe "$BIN/cachecoin-cli.exe"
+          strip --strip-all "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"
+          for exe in "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"; do
+            objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
+              if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" "$BIN/"; fi
+            done
+          done
+          cd "$BIN"
+          ./cachecoind.exe --version
+          ./cachecoin-cli.exe --version
+          sha256sum -- *.exe *.dll > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
