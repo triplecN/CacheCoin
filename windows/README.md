@@ -27,7 +27,9 @@ CacheCoin-Windows-<version>/
     ...                         # every file from windows\docs\
   tor\
     tor.exe                     # Tor Expert Bundle
-    LICENSE                     # Tor license and other bundle files
+    data\geoip, geoip6          # bundle data files
+    docs\tor.txt                # Tor license and component licenses
+    pluggable_transports\       # as shipped in the bundle
     ...
   version.json                  # pins, patch fingerprint, per-file sha256
   SHA256SUMS.windows.txt        # sha256 of every file above
@@ -76,9 +78,10 @@ suites; see `doc/build-windows.md`.
    before unpacking. This is the only point where the Tor version is pinned;
    record the version (download page or `tor.exe --version` on Windows) for the
    release notes.
-3. Unpack it. The directory that directly contains `tor.exe` and the license
-   file is `--tor-dir`. Everything in it is copied, including DLLs and any
-   `Data\` folder.
+3. Unpack it. Pass the extracted bundle root as `--tor-dir`; the script also
+   accepts a directory that contains `tor.exe` directly. In the bundle layout
+   it copies `tor/` to the package's `tor/`, and `data/` and `docs/` (including
+   the Tor license, `docs/tor.txt`) into `tor/data` and `tor/docs`.
 
 `version.json` identifies the bundle by the sha256 of every Tor file; there is
 no separate version string in the schema.

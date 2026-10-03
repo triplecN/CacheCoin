@@ -39,7 +39,8 @@ usage: bash windows/build_package.sh --bin-dir <dir> --tor-dir <dir> \
          --version <x.y.z> --out <dir> [--launcher-dir <dir>] [--docs-dir <dir>]
 
   --bin-dir       directory containing cachecoind.exe and cachecoin-cli.exe
-  --tor-dir       directory containing tor.exe and the Tor bundle license file(s)
+  --tor-dir       directory containing tor.exe, or the extracted Tor Expert
+                  Bundle root (which contains tor/, data/ and docs/)
   --version       package version, x.y.z (a leading "v" is accepted and stripped)
   --out           output directory; the package directory and zip are created here
   --launcher-dir  directory containing CacheCoin.cmd and launcher/CacheCoin.ps1
@@ -133,9 +134,16 @@ PATCHES=("$REPO_ROOT"/patches/*.patch)
 for f in cachecoind.exe cachecoin-cli.exe; do
     [ -f "$BIN_DIR/$f" ] || die "missing binary: $BIN_DIR/$f"
 done
-[ -f "$TOR_DIR/tor.exe" ] || die "missing tor executable: $TOR_DIR/tor.exe"
-if ! find "$TOR_DIR" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' \) | grep -q .; then
-    die "no license file found under $TOR_DIR (the Tor Expert Bundle license must travel with the bundle)"
+TOR_MODE=""
+if [ -f "$TOR_DIR/tor.exe" ]; then
+    TOR_MODE="flat"
+elif [ -f "$TOR_DIR/tor/tor.exe" ]; then
+    TOR_MODE="bundle"
+else
+    die "tor.exe not found: expected $TOR_DIR/tor.exe or $TOR_DIR/tor/tor.exe"
+fi
+if ! find "$TOR_DIR" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'tor.txt' \) | grep -q .; then
+    die "no license file found under $TOR_DIR (the Tor license must travel with the bundle; the Expert Bundle ships docs/tor.txt)"
 fi
 [ -f "$LAUNCHER_DIR/launcher/CacheCoin.ps1" ] || die "missing launcher: $LAUNCHER_DIR/launcher/CacheCoin.ps1"
 [ -f "$LAUNCHER_DIR/CacheCoin.cmd" ] || die "missing launcher shim: $LAUNCHER_DIR/CacheCoin.cmd"
@@ -172,7 +180,13 @@ for f in "$BIN_DIR"/*; do
     cp -- "$f" "$PKG/bin/"
 done
 
-cp -R -- "$TOR_DIR"/. "$PKG/tor/"
+if [ "$TOR_MODE" = "bundle" ]; then
+    cp -R -- "$TOR_DIR/tor"/. "$PKG/tor/"
+    if [ -d "$TOR_DIR/data" ]; then cp -R -- "$TOR_DIR/data" "$PKG/tor/data"; fi
+    if [ -d "$TOR_DIR/docs" ]; then cp -R -- "$TOR_DIR/docs" "$PKG/tor/docs"; fi
+else
+    cp -R -- "$TOR_DIR"/. "$PKG/tor/"
+fi
 
 cp -R -- "$LAUNCHER_DIR/launcher"/. "$PKG/launcher/"
 cp -- "$LAUNCHER_DIR/CacheCoin.cmd" "$PKG/CacheCoin.cmd"
