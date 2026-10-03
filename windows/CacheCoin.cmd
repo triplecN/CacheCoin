@@ -1,2 +1,5 @@
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launcher\CacheCoin.ps1" %*
+setlocal
+set "ARGS=%*"
+set "ARGS=%ARGS:/silent=-Silent%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launcher\CacheCoin.ps1" %ARGS%

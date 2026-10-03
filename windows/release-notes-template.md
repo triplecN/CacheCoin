@@ -41,8 +41,9 @@ Get-FileHash CacheCoin-Windows-<version>.zip -Algorithm SHA256
 
 A portable Windows package of `cachecoind.exe` and `cachecoin-cli.exe` from the
 tagged tree, with the PowerShell launcher, the documentation and the Tor Expert
-Bundle. The node is Tor-only; start Tor before the node. The data directory is
-`%APPDATA%\CacheCoin`, not `~/.cachecoin`.
+Bundle. The node is Tor-only; the launcher uses Tor on 9050/9150 and starts the
+bundled Tor if none is running. The data directory is `%APPDATA%\CacheCoin`, not
+`~/.cachecoin`.
 
 ## Honest limits
 
