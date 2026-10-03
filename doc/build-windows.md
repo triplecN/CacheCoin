@@ -20,10 +20,9 @@ your machine; the resulting `.exe` is outside this repository's test suites.
 Install MSYS2, open **MSYS2 MINGW64** from the Start menu, then:
 
 ```bash
-  pacman -S --needed git mingw-w64-x86_64-toolchain \
+  pacman -S --needed git make mingw-w64-x86_64-toolchain \
   mingw-w64-x86_64-cmake mingw-w64-x86_64-boost mingw-w64-x86_64-libevent \
-  mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-natpmp \
-  mingw-w64-x86_64-zeromq python
+  mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-zeromq python
 ```
 
 ## 2. Clone the pinned sources
@@ -53,9 +52,9 @@ done
 ```
 
 The order matters, and so does the filename glob. `patches/0001-...` has to land before
-`patches/0019-...`, and the series has to be applied as a whole: later patches edit code
+`patches/0020-...`, and the series has to be applied as a whole: later patches edit code
 that earlier ones add, and `patches/0012` removes development comments the earlier patches
-carried. Apply them in filename order, 0001 through 0019; never apply them individually
+carried. Apply them in filename order, 0001 through 0020; never apply them individually
 with a GUI patch tool.
 (On Windows, make sure Git checked the sources out with LF; see the `core.autocrlf` line in
 `.github/workflows/build.yml`, or `git apply --index` can fail with "does not match index".)
@@ -69,7 +68,7 @@ install a library or build extra executables into the CacheCoin output.
 mkdir -p /c/b/src/crypto/randomx/build
 cd /c/b/src/crypto/randomx/build
 cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
-make -j4
+cmake --build . -j4
 ./randomx-tests > randomx-tests.log && tail -1 randomx-tests.log
 cd /c/b
 cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
@@ -88,8 +87,21 @@ computes a different proof-of-work than the network expects, and the node must n
 mkdir -p /c/CacheCoin-bin
 cp /c/b/build/bin/bitcoind.exe   /c/CacheCoin-bin/cachecoind.exe
 cp /c/b/build/bin/bitcoin-cli.exe /c/CacheCoin-bin/cachecoin-cli.exe
+# Drop debug information: the MSYS2 Release build keeps DWARF by default and
+# the executables are otherwise hundreds of megabytes.
+strip --strip-all /c/CacheCoin-bin/cachecoind.exe /c/CacheCoin-bin/cachecoin-cli.exe
+# The MSYS2 build is dynamically linked. Copy the MinGW runtime and library
+# DLLs next to the executables so the folder runs on a machine without MSYS2;
+# Windows searches the application directory first. Only names that exist in
+# /mingw64/bin are copied, so system DLLs are never shipped.
+for exe in /c/CacheCoin-bin/cachecoind.exe /c/CacheCoin-bin/cachecoin-cli.exe; do
+  objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
+    if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" /c/CacheCoin-bin/; fi
+  done
+done
 cd /c/CacheCoin-bin
-sha256sum cachecoind.exe cachecoin-cli.exe > SHA256SUMS.txt
+./cachecoind.exe --version
+sha256sum -- *.exe *.dll > SHA256SUMS.txt
 ```
 
 ## Known limitations
@@ -105,6 +117,11 @@ sha256sum cachecoind.exe cachecoin-cli.exe > SHA256SUMS.txt
   Both use `%APPDATA%\CacheCoin\.cookie` when `sys.platform == "win32"` (the Linux path
   is `~/.cachecoin/.cookie`). `CACHECOIN_RPC_COOKIE` still overrides it if the data
   directory is somewhere else.
+- **The binaries are dynamically linked.** They load the MinGW runtime and
+  library DLLs (`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll`,
+  `libevent-*.dll`, `libsqlite3-0.dll`, ...). Keep those DLLs next to the
+  executables; Windows searches the application directory first. The CI job
+  collects them with `ldd`; a hand-built folder needs the same step (section 5).
 - **The binaries are unsigned.** Windows SmartScreen will show "Windows protected your PC" on
   first launch, and you have to choose More info, then Run anyway. That warning is expected for
   any unsigned build. Verify the SHA-256 against `SHA256SUMS.txt` before you do.
