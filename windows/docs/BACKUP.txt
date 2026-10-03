@@ -1,0 +1,22 @@
+Backups - read this before mining
+=================================
+
+CacheCoin wallets have no seed phrase. The wallet file is the wallet.
+
+Before mining starts, the launcher saves two files to the folder you choose:
+
+  cachecoin-main-wallet-<date>.bak     the wallet file
+  cachecoin-main-descriptors-<date>.json   the keys, in text form
+
+Both files together can spend your coins. Anyone who has them can take your
+coins. There is no recovery service and no support line. If you lose both
+files, the coins are gone.
+
+Rules:
+- Save them to a USB drive or another disk, not the same disk as the app.
+- Keep copies offline. Do not email them. Do not upload them.
+- Check the SHA-256 values the launcher prints against the files later.
+- If you receive coins later, make a fresh backup; an old backup may not
+  include newer addresses.
+
+The launcher will not start mining until you type the confirmation sentence.

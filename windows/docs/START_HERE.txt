@@ -1,0 +1,18 @@
+CacheCoin (CCCN) - START HERE
+============================
+
+CacheCoin is a small, Tor-only cryptocurrency. This folder runs a full node,
+and optionally mines on your CPU.
+
+1. Double-click CacheCoin.cmd
+2. Choose "Node only" unless you want to mine. Mining is a lottery: you may
+   find a block, you may not. There is no guaranteed reward.
+3. The first start can take a few minutes; the node syncs over Tor.
+4. Your data lives in %APPDATA%\CacheCoin. The log is in logs\launcher.log.
+5. To stop: right-click the tray icon and choose "Stop CacheCoin".
+6. Never delete the data folder while the node is running.
+
+Tor is required. If Tor is not already running, the bundled copy starts
+automatically. If mining, you MUST save a backup first; see docs\BACKUP.txt.
+
+This software is provided as is, without warranty. It is not financial advice.

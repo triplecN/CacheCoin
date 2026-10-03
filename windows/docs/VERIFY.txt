@@ -1,0 +1,26 @@
+Verifying the download
+======================
+
+These binaries are unsigned. Windows SmartScreen will show "Windows protected
+your PC" on first launch. That is expected for any unsigned build. Verify the
+files before you click "More info", then "Run anyway".
+
+1. Check the ZIP hash against the value published with the release:
+
+   Get-FileHash .\CacheCoin-Windows-<version>.zip -Algorithm SHA256
+
+2. The release also publishes SHA256SUMS.windows.txt and a detached GPG
+   signature (SHA256SUMS.windows.txt.asc). If you have the project's public
+   key, verify the signature; the hashes alone prove only that the download
+   was not corrupted in transit.
+
+3. Inside the ZIP, version.json lists the SHA-256 of every file. The launcher
+   checks the node and Tor executables against it on every start, and refuses
+   to run a file that does not match.
+
+4. To verify by hand after unpacking:
+
+   Get-ChildItem -Recurse -File | Get-FileHash -Algorithm SHA256
+
+If any hash differs from the published one, delete the download and get a
+fresh copy from the official source. Do not run it.
