@@ -1,0 +1,87 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Databases & local state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+explorer.db
+data/
+
+# C / C++ build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+# Binaries are built from source (scripts/build_linux.sh); never commit locally
+# built executables: they contain build paths of the machine that made them.
+bin/
+
+# Build directories
+build/
+dist/
+
+# Logs & temp
+*.log
+tmp/
+temp/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node datadirs & private keys
+# Only wallet backups are ignored as JSON; everything else stays visible in
+# git status so future test vectors or configs are not silently skipped.
+wallet_backup*.json
+.cachecoin/
+cachecoin_node*/
+test_network/
+private/
+audit/
+onion_v3_private_key
+.cookie
+wallet.dat
+
+# Patch/merge leftovers
+*.rej
+*.orig
+
+# Keys and Tor state that must never be committed
+*.pem
+*.key
+*.onion
+hostname
+*.swp
+
+# Generated release artifacts
+release/
+SHA256SUMS.txt
+SHA256SUMS.txt.asc
+
+# Local build state
+.cachecoin-patches
+
+# Backup leftovers
+*.bak
+*~
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# Environment files
+.env
+*.env

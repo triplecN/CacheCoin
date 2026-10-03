@@ -1,0 +1,5 @@
+# CacheCoin is a Linux/WSL2 project and its patch series is applied with
+# `git apply`, so every text file must be stored and checked out with LF.
+# Without this, a Windows clone with core.autocrlf=true turns patches and
+# scripts into CRLF and `git apply --index` fails with "does not match index".
+* text=auto eol=lf
