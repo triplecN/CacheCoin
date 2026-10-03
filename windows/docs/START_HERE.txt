@@ -9,8 +9,12 @@ and optionally mines on your CPU.
    find a block, you may not. There is no guaranteed reward.
 3. The first start can take a few minutes; the node syncs over Tor.
 4. Your data lives in %APPDATA%\CacheCoin. The log is in logs\launcher.log.
-5. To stop: right-click the tray icon and choose "Stop CacheCoin".
+5. To stop: right-click the tray icon and choose "Stop CacheCoin". Prefer the
+   tray button; closing the window can leave the node running in the
+   background (the next start attaches to it).
 6. Never delete the data folder while the node is running.
+7. Mining starts only after you save and confirm a backup (see BACKUP.txt).
+   Until then, an automatic start keeps the node running but does not mine.
 
 Tor is required. If Tor is not already running, the bundled copy starts
 automatically. If mining, you MUST save a backup first; see docs\BACKUP.txt.

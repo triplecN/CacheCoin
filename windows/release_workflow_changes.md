@@ -13,9 +13,10 @@ binaries are not attached because the suites do not test them. Nothing in the
 workflow signs anything; the `.asc` is added offline (`doc/release.md`).
 
 `build.yml`'s `windows-build` job builds `cachecoind.exe` and
-`cachecoin-cli.exe`, but it is `continue-on-error: true` and its artifact
-expires after 90 days. Attaching an artifact that may be absent, stale or from a
-different commit would conflict with the honesty rules in `doc/release.md`.
+`cachecoin-cli.exe` and is required (a failure fails the run), but its artifact
+expires after 90 days and could still be from a different commit than the tag.
+Attaching an artifact that may be stale or from a different commit would
+conflict with the honesty rules in `doc/release.md`.
 
 ## Design
 
@@ -26,10 +27,9 @@ different commit would conflict with the honesty rules in `doc/release.md`.
   built inside that release run, from the same tag, and attached to the same
   draft.
 - Build the `.exe` files in the release run rather than downloading the
-  `build.yml` artifact: the artifact can be missing (`continue-on-error`),
-  expired, or from another run, and `actions/download-artifact` cannot reach
-  across workflow runs without a run id and token. A same-run build keeps the
-  Windows package bound to the tag.
+  `build.yml` artifact: the artifact can be expired or from another run, and
+  `actions/download-artifact` cannot reach across workflow runs without a run id
+  and token. A same-run build keeps the Windows package bound to the tag.
 - Signing stays offline. CI attaches the zip and `SHA256SUMS.windows.txt`; the
   maintainer adds `SHA256SUMS.windows.txt.asc` by hand before publishing.
 
@@ -117,26 +117,40 @@ file for the chosen release.
           msystem: MINGW64
           update: true
           install: >-
-            git mingw-w64-x86_64-toolchain
+            git make mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake mingw-w64-x86_64-boost
             mingw-w64-x86_64-libevent mingw-w64-x86_64-sqlite3
-            mingw-w64-x86_64-miniupnpc mingw-w64-x86_64-natpmp
             mingw-w64-x86_64-zeromq python
       # Copy the "Clone pinned sources", "Apply CacheCoin patches in order",
       # "Build RandomX + node" and "Smoke test" steps from build.yml verbatim.
-      - name: Collect cachecoin-named binaries
+      - name: Collect cachecoin-named binaries and their DLLs
+        # build_package.sh copies every file in --bin-dir except the artifact's
+        # own SHA256SUMS.txt, so the MinGW runtime DLLs must be collected here.
         run: |
-          mkdir -p /c/b/build/bin-ci
-          cp /c/b/build/bin/bitcoind.exe /c/b/build/bin-ci/cachecoind.exe
-          cp /c/b/build/bin/bitcoin-cli.exe /c/b/build/bin-ci/cachecoin-cli.exe
+          BIN=/c/b/build/bin-ci
+          mkdir -p "$BIN"
+          cp /c/b/build/bin/bitcoind.exe "$BIN/cachecoind.exe"
+          cp /c/b/build/bin/bitcoin-cli.exe "$BIN/cachecoin-cli.exe"
+          strip --strip-all "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"
+          for exe in "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"; do
+            objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
+              if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" "$BIN/"; fi
+            done
+          done
+          cd "$BIN"
+          ./cachecoind.exe --version
+          sha256sum -- *.exe *.dll > SHA256SUMS.txt
       - name: Fetch and verify the Tor Expert Bundle
         run: |
           curl -fsSLo tor.tar.gz "$TOR_EXPERT_URL"
           echo "$TOR_EXPERT_SHA256  tor.tar.gz" | sha256sum -c -
           mkdir -p tor-expert
-          # The Expert Bundle tarball has a single top-level tor/ directory.
-          tar -xzf tor.tar.gz -C tor-expert --strip-components=1
-          test -f tor-expert/tor.exe
+          # The Expert Bundle has tor/, data/ and docs/ at the top level; keep
+          # that layout and pass the extraction root to build_package.sh, which
+          # understands the bundle layout.
+          tar -xzf tor.tar.gz -C tor-expert
+          test -f tor-expert/tor/tor.exe
+          test -f tor-expert/docs/tor.txt
       - name: Assemble the package
         run: |
           mkdir -p "$GITHUB_WORKSPACE/win-release"
@@ -188,7 +202,10 @@ fingerprint, the Tor version and the signing key fingerprint. Optionally
 automate the mechanical part:
 
 ```bash
-gh release edit "${GITHUB_REF_NAME}" --notes-file windows/release-notes-template.md
+# Fill a copy of the template first: publishing the raw file would ship the
+# <placeholders> as the release notes.
+cp windows/release-notes-template.md /tmp/notes.md   # then edit /tmp/notes.md
+gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/notes.md
 ```
 
 The template states, in the release itself: not reproducible; sha256 proves
@@ -215,8 +232,9 @@ outside the suites; mining is a lottery; no financial advice.
 ## Alternative considered
 
 Add the Windows assets to `build.yml` and download the `cachecoin-windows`
-artifact in `release.yml` with `gh run download`. Rejected for now: it couples
-the release to a build run that is `continue-on-error` and expires, needs a run
-id or artifact name lookup, and makes it possible to publish binaries from a
-different commit than the tag. If the Windows job becomes mandatory and green,
-this alternative becomes reasonable.
+artifact in `release.yml` with `gh run download`. Rejected for now: the artifact
+expires and needs a run id or artifact name lookup, and it makes it possible to
+publish binaries from a different commit than the tag. The Windows job is
+mandatory and green now, so this alternative is workable if the run id is
+recorded at tag time; it is left out only to keep the release bound to a
+same-run build.

@@ -35,6 +35,7 @@ $script:Address = ''
 $script:Attempts = 0
 $script:FoundBlocks = 0
 $script:LastTipTime = 0
+$script:LastMiningErrorLog = $null
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -64,14 +65,26 @@ function Get-Sha256 {
 }
 
 function Test-PackageHashes {
-    if (-not (Test-Path -LiteralPath $script:VersionFile)) { return }
+    if (-not (Test-Path -LiteralPath $script:VersionFile)) {
+        Write-Log 'No version.json found; file hashes are not being verified.' 'WARN'
+        return
+    }
     $manifest = $null
     try { $manifest = Get-Content -LiteralPath $script:VersionFile -Raw | ConvertFrom-Json } catch { Fail 'version.json is unreadable. Download the package again.' }
-    if (-not $manifest.files) { return }
+    if (-not $manifest.files) {
+        Write-Log 'version.json lists no files; hashes are not being verified.' 'WARN'
+        return
+    }
     foreach ($prop in $manifest.files.PSObject.Properties) {
         $rel = $prop.Name -replace '/', '\'
         $full = Join-Path $script:Root $rel
-        if (-not (Test-Path -LiteralPath $full)) { continue }
+        if (-not (Test-Path -LiteralPath $full)) {
+            if ($rel -match '^(bin|tor)\\') {
+                Fail "A program file listed in version.json is missing: $rel. Download the package again."
+            }
+            Write-Log "Packaged file is missing: $rel" 'WARN'
+            continue
+        }
         $actual = Get-Sha256 $full
         if ($actual -ne ([string]$prop.Value).ToLowerInvariant()) {
             Fail ("A file does not match the published hash: {0}`nExpected: {1}`nFound:    {2}`nDo not run this copy; download it again." -f $rel, $prop.Value, $actual)
@@ -170,30 +183,52 @@ function Initialize-Config {
     if ($Listen) {
         $required['listen'] = '1'
         $required['listenonion'] = '1'
-        $required['torcontrol'] = '127.0.0.1:9051'
+        if ($ProxyPort -eq 9150) { $required['torcontrol'] = '127.0.0.1:9151' } else { $required['torcontrol'] = '127.0.0.1:9051' }
+        if (-not $script:StartedTor) {
+            Write-Log 'Incoming connections need a Tor with a control port; an external Tor without one will not create an onion service.' 'WARN'
+        }
     } else {
         $required['listen'] = '0'
     }
     if (-not (Test-Path -LiteralPath $script:ConfPath)) {
         $content = @()
         foreach ($k in $required.Keys) { $content += "$k=$($required[$k])" }
-        Set-Content -LiteralPath $script:ConfPath -Value $content -Encoding ASCII
+        try { Set-Content -LiteralPath $script:ConfPath -Value $content -Encoding ASCII }
+        catch { Fail "Could not write $($script:ConfPath): $($_.Exception.Message)" }
         Write-Log "Created $($script:ConfPath)"
         return
     }
-    $existing = Get-Content -LiteralPath $script:ConfPath
-    $added = @()
+    $raw = Get-Content -LiteralPath $script:ConfPath -Raw
+    if ($null -eq $raw) { $raw = '' }
+    $existing = $raw -split "`r?`n"
+    $missing = @()
     foreach ($k in $required.Keys) {
         $found = $false
         foreach ($l in $existing) {
             if ($l -match ("^\s*" + [regex]::Escape($k) + "\s*=")) { $found = $true; break }
         }
-        if (-not $found) {
-            Add-Content -LiteralPath $script:ConfPath -Value "$k=$($required[$k])"
-            $added += $k
-        }
+        if (-not $found) { $missing += $k }
     }
-    if ($added.Count -gt 0) { Write-Log ('Added missing settings: ' + ($added -join ', ')) }
+    $proxyValue = [string]$required['proxy']
+    $proxyChanged = $false
+    $newLines = New-Object System.Collections.Generic.List[string]
+    foreach ($l in $existing) {
+        if ($l -match '^\s*proxy\s*=\s*127\.0\.0\.1:\d+\s*$' -and $l.Trim() -ne "proxy=$proxyValue") {
+            $newLines.Add("proxy=$proxyValue")
+            $proxyChanged = $true
+            continue
+        }
+        $newLines.Add($l)
+    }
+    if ($missing.Count -gt 0) {
+        foreach ($k in $missing) { $newLines.Add("$k=$($required[$k])") }
+    }
+    if ($missing.Count -gt 0 -or $proxyChanged) {
+        try { Set-Content -LiteralPath $script:ConfPath -Value $newLines -Encoding ASCII }
+        catch { Fail "Could not update $($script:ConfPath): $($_.Exception.Message)" }
+        if ($missing.Count -gt 0) { Write-Log ('Added missing settings: ' + ($missing -join ', ')) }
+        if ($proxyChanged) { Write-Log "Updated the local proxy setting to 127.0.0.1:$ProxyPort." }
+    }
 }
 
 function Invoke-Rpc {
@@ -226,7 +261,11 @@ function Start-Node {
         return
     }
     Write-Log 'Starting the node...'
-    $script:NodeProcess = Start-Process -FilePath $script:Daemon -ArgumentList @("`"-datadir=$($script:DataDir)`"", "`"-conf=$($script:ConfPath)`"") -WindowStyle Hidden -PassThru
+    try {
+        $script:NodeProcess = Start-Process -FilePath $script:Daemon -ArgumentList @("`"-datadir=$($script:DataDir)`"", "`"-conf=$($script:ConfPath)`"") -WindowStyle Hidden -PassThru
+    } catch {
+        Fail "Could not start the node: $($_.Exception.Message)"
+    }
     $script:NodeStartedByUs = $true
 }
 
@@ -339,7 +378,7 @@ function Update-Mining {
         Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
         $script:MiningJobs = @($script:MiningJobs | Where-Object { $_.Id -ne $j.Id })
         $script:Attempts += 500
-        if ($result -and $result.Output) {
+        if ($result -and $result.ExitCode -eq 0 -and $result.Output -match '[0-9a-f]{64}') {
             $script:FoundBlocks++
             $height = 0
             $h = Invoke-Rpc @('getblockcount')
@@ -347,6 +386,12 @@ function Update-Mining {
             $reward = 5
             if ($height -gt 720) { $reward = 10 }
             Write-Log ('Block found! +{0} CCCN at height {1}. Spendable after 100 more blocks.' -f $reward, $height)
+        } elseif ($result -and $result.ExitCode -ne 0) {
+            if (-not $script:LastMiningErrorLog -or ((Get-Date) - $script:LastMiningErrorLog).TotalSeconds -ge 60) {
+                $firstLine = ($result.Output -split "`r?`n")[0]
+                Write-Log "A mining worker returned an error and will be retried: $firstLine" 'WARN'
+                $script:LastMiningErrorLog = Get-Date
+            }
         }
     }
     $target = Get-MiningWorkerCount
@@ -383,6 +428,13 @@ function Update-MiningGate {
 
 function Get-OrCreateWallet {
     if (Invoke-Rpc @('-rpcwallet=main', 'getwalletinfo')) { return $true }
+    # A wallet on disk is not loaded automatically by a fresh daemon, so try to
+    # load the existing wallet before creating a new one (createwallet would
+    # fail with "Database already exists" otherwise).
+    if (Invoke-Rpc @('loadwallet', 'main')) {
+        Start-Sleep -Seconds 2
+        if (Invoke-Rpc @('-rpcwallet=main', 'getwalletinfo')) { return $true }
+    }
     Write-Log 'Creating the mining wallet...'
     if (-not (Invoke-Rpc @('createwallet', 'main'))) { return $false }
     Start-Sleep -Seconds 2
@@ -403,7 +455,7 @@ function Invoke-BackupGate {
     $folder = Read-Host 'Backup folder'
     if (-not $folder) { return $false }
     $folder = $folder.Trim().Trim('"')
-    if ($folder.StartsWith('\\')) {
+    if ($folder.StartsWith('\\') -or $folder.StartsWith('//')) {
         Write-Host 'Network paths are not allowed. Use a local folder or a USB drive.'
         return $false
     }
@@ -413,7 +465,8 @@ function Invoke-BackupGate {
         Write-Host 'That folder does not exist.'
         return $false
     }
-    if ($resolved.StartsWith($script:DataDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $dataDirWithSlash = $script:DataDir.TrimEnd('\') + '\'
+    if (($resolved.TrimEnd('\') + '\').StartsWith($dataDirWithSlash, [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Host 'Choose a folder outside the CacheCoin data directory.'
         return $false
     }
@@ -460,14 +513,24 @@ function Write-State {
 }
 
 function Enable-Autostart {
-    $cmd = Join-Path $script:Root 'CacheCoin.cmd'
-    & schtasks.exe /Create /SC ONLOGON /TN 'CacheCoin Node' /TR "`"$cmd`" /silent" /F 2>&1 | Out-Null
-    Write-Log 'Autostart enabled.'
+    try {
+        $cmd = Join-Path $script:Root 'CacheCoin.cmd'
+        $action = New-ScheduledTaskAction -Execute $cmd -Argument '/silent'
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        Register-ScheduledTask -TaskName 'CacheCoin Node' -Action $action -Trigger $trigger -Force | Out-Null
+        Write-Log 'Autostart enabled.'
+    } catch {
+        Write-Log "Could not enable autostart: $($_.Exception.Message)" 'ERROR'
+    }
 }
 
 function Disable-Autostart {
-    & schtasks.exe /Delete /TN 'CacheCoin Node' /F 2>&1 | Out-Null
-    Write-Log 'Autostart disabled.'
+    try {
+        Unregister-ScheduledTask -TaskName 'CacheCoin Node' -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Log 'Autostart disabled.'
+    } catch {
+        Write-Log "Could not disable autostart: $($_.Exception.Message)" 'ERROR'
+    }
 }
 
 function Show-StatusDialog {
@@ -579,18 +642,23 @@ try {
         }
     }
 
+    $backupConfirmed = $false
+    if ($state -and $state.backupConfirmed) { $backupConfirmed = $true }
     if ($chosen -eq 'mining') {
         if (-not (Get-OrCreateWallet)) { Fail 'Could not open or create the wallet.' }
         $script:Address = Get-MiningAddress
         if (-not $script:Address) { Fail 'Could not get a mining address.' }
         Write-Log "Mining address: $($script:Address)"
-        $backupOk = $true
-        if (-not $Silent) { $backupOk = Invoke-BackupGate }
-        if ($backupOk) {
-            Start-Mining
-        } else {
-            Write-Host 'Mining was not started because the backup was not confirmed.'
+        if (-not $backupConfirmed) {
+            if ($Silent) {
+                Write-Log 'Mining is configured but no backup has been confirmed on this computer yet. Run CacheCoin.cmd once without -Silent, save the backup, and mining will start.' 'WARN'
+            } elseif (Invoke-BackupGate) {
+                $backupConfirmed = $true
+            } else {
+                Write-Host 'Mining was not started because the backup was not confirmed.'
+            }
         }
+        if ($backupConfirmed) { Start-Mining }
     }
 
     if (-not $Silent -and -not $state) {
@@ -598,7 +666,7 @@ try {
         if ($a -match '^[Yy]') { Enable-Autostart } else { Disable-Autostart }
     }
 
-    Write-State ([ordered]@{ mode = $chosen; version = 1 })
+    Write-State ([ordered]@{ mode = $chosen; backupConfirmed = $backupConfirmed; version = 1 })
 
     $interactive = -not $Silent
     if ($interactive) {
@@ -618,6 +686,7 @@ try {
 
     $lastStatus = (Get-Date).AddSeconds(-15)
     $restarts = 0
+    $nodeStartedAt = Get-Date
     $deadline = $null
     if ($RunSeconds -gt 0) { $deadline = (Get-Date).AddSeconds($RunSeconds) }
     while (-not $script:StopRequested) {
@@ -636,12 +705,23 @@ try {
             }
         }
         if ($script:NodeProcess -and $script:NodeProcess.HasExited) {
+            if (((Get-Date) - $nodeStartedAt).TotalMinutes -ge 10) { $restarts = 0 }
             $restarts++
             if ($restarts -le 3) {
                 Write-Log 'The node stopped unexpectedly; restarting it.' 'WARN'
                 Start-Sleep -Seconds 10
                 Start-Node
-                if (-not (Wait-Rpc -Seconds 180)) { Write-Log 'The node did not come back.' 'ERROR' }
+                $nodeStartedAt = Get-Date
+                if (-not (Wait-Rpc -Seconds 180)) {
+                    Write-Log 'The node did not come back.' 'ERROR'
+                } elseif ($script:Mining) {
+                    if (Get-OrCreateWallet) {
+                        $script:Address = Get-MiningAddress
+                    } else {
+                        Stop-Mining
+                        Write-Log 'The wallet could not be reopened after the restart; mining is paused. Use the tray menu to resume once the node is healthy.' 'WARN'
+                    }
+                }
             } else {
                 Write-Log 'The node keeps stopping; giving up. See the log.' 'ERROR'
                 $script:StopRequested = $true

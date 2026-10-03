@@ -34,6 +34,7 @@ cd /c/b
 test "$(git rev-parse 'v31.1^{commit}')" = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
 git clone https://github.com/tevador/RandomX.git src/crypto/randomx
 git -C src/crypto/randomx checkout --quiet 7607fb2faed24d5a679e139a9828d194bbc644a4
+test "$(git -C src/crypto/randomx rev-parse HEAD)" = "7607fb2faed24d5a679e139a9828d194bbc644a4"
 ```
 
 The two `test`/`checkout` lines are not optional. They pin Bitcoin Core and RandomX to the exact
@@ -121,7 +122,7 @@ sha256sum -- *.exe *.dll > SHA256SUMS.txt
   library DLLs (`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll`,
   `libevent-*.dll`, `libsqlite3-0.dll`, ...). Keep those DLLs next to the
   executables; Windows searches the application directory first. The CI job
-  collects them with `ldd`; a hand-built folder needs the same step (section 5).
+  collects them with `objdump`; a hand-built folder needs the same step (section 5).
 - **The binaries are unsigned.** Windows SmartScreen will show "Windows protected your PC" on
   first launch, and you have to choose More info, then Run anyway. That warning is expected for
   any unsigned build. Verify the SHA-256 against `SHA256SUMS.txt` before you do.

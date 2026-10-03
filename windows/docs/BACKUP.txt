@@ -20,3 +20,5 @@ Rules:
   include newer addresses.
 
 The launcher will not start mining until you type the confirmation sentence.
+Until that confirmation is saved, mining does not start either, including after
+a reboot or an automatic start.

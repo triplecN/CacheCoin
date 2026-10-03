@@ -142,7 +142,7 @@ elif [ -f "$TOR_DIR/tor/tor.exe" ]; then
 else
     die "tor.exe not found: expected $TOR_DIR/tor.exe or $TOR_DIR/tor/tor.exe"
 fi
-if ! find "$TOR_DIR" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'tor.txt' \) | grep -q .; then
+if [ -z "$(find "$TOR_DIR" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'tor.txt' \) -print -quit)" ]; then
     die "no license file found under $TOR_DIR (the Tor license must travel with the bundle; the Expert Bundle ships docs/tor.txt)"
 fi
 [ -f "$LAUNCHER_DIR/launcher/CacheCoin.ps1" ] || die "missing launcher: $LAUNCHER_DIR/launcher/CacheCoin.ps1"
@@ -321,10 +321,18 @@ try {
 }
 PSEOF
         ps1_w="$TMP_PS1"
+        pkg_w="$PKG"
+        zip_w="$ZIP"
         if command -v cygpath >/dev/null 2>&1; then
             ps1_w="$(cygpath -w "$TMP_PS1")"
+            pkg_w="$(cygpath -w "$PKG")"
+            zip_w="$(cygpath -w "$ZIP")"
+        elif command -v wslpath >/dev/null 2>&1; then
+            ps1_w="$(wslpath -w "$TMP_PS1")"
+            pkg_w="$(wslpath -w "$PKG")"
+            zip_w="$(wslpath -w "$ZIP")"
         fi
-        CCCN_PKG="$PKG" CCCN_ZIP="$ZIP" powershell.exe -NoProfile -NonInteractive \
+        CCCN_PKG="$pkg_w" CCCN_ZIP="$zip_w" powershell.exe -NoProfile -NonInteractive \
             -ExecutionPolicy Bypass -File "$ps1_w"
         rm -f -- "$TMP_PS1"
         trap - EXIT

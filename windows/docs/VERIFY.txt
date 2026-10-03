@@ -16,7 +16,8 @@ files before you click "More info", then "Run anyway".
 
 3. Inside the ZIP, version.json lists the SHA-256 of every file. The launcher
    checks the node and Tor executables against it on every start, and refuses
-   to run a file that does not match.
+   to run a file that does not match. If a program file under bin\ or tor\ is
+   missing, the launcher refuses to start and tells you to download again.
 
 4. To verify by hand after unpacking:
 
