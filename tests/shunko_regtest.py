@@ -327,8 +327,13 @@ def main():
         wait_for(lambda: synced(b, d), 120, "D synced from B")
         addr_c = f"{ONION_C}:{c.p2p_port}"
         addr_d = f"{ONION_D}:{d.p2p_port}"
-        res = a.rpc("addpeeraddress", ONION_C, c.p2p_port, True)
-        check(res["success"], "addrman accepted the onion target as a tried address")
+        # tried=false on purpose: addpeeraddress with tried=true calls AddrMan::Good,
+        # which can fail on a tried-bucket collision (the bucket key is a random
+        # per-datadir nKey), making the RPC's success flag flaky. The test only
+        # needs the entries to be known to addrman, and Select() draws from the new
+        # table as well.
+        res = a.rpc("addpeeraddress", ONION_C, c.p2p_port, False)
+        check(res["success"], "addrman accepted the onion target as a known address")
         a.rpc("addnode", addr_c, "onetry")
         wait_for(lambda: any(p["addr"] == addr_c for p in a.rpc("getpeerinfo")), 30,
                  "A connected to C through the proxy")
@@ -338,7 +343,7 @@ def main():
         # exclusion must compare the network address, not IP:port. With the old
         # equality this entry would be selected and the proxy would hand the
         # transaction back to C, the peer the sender is connected to.
-        res = a.rpc("addpeeraddress", ONION_C, 39999, True)
+        res = a.rpc("addpeeraddress", ONION_C, 39999, False)
         check(res["success"], "addrman accepted a second port for the connected onion")
         r6 = a.rpc("send", {addr_b: 0.2}, None, "unset", None,
                    {"add_to_wallet": False, "lock_unspents": True}, wallet="w")
@@ -348,7 +353,7 @@ def main():
         except RuntimeError as e:
             refused = "no proxy-reachable peer" in str(e) or "No known nodes" in str(e)
         check(refused, "another port of the connected onion is not a usable target")
-        res = a.rpc("addpeeraddress", ONION_D, d.p2p_port, True)
+        res = a.rpc("addpeeraddress", ONION_D, d.p2p_port, False)
         check(res["success"], "addrman accepted the second onion target")
 
         def auto_handover(amount):
@@ -389,8 +394,8 @@ def main():
         # accept the same address the user named.
         down_addr = f"{ONION_DOWN}:{DEAD_ONION_PORT}"
         cfg.start(extra_args=a_args + [f"-connect={down_addr}"])
-        res = cfg.rpc("addpeeraddress", ONION_DOWN, DEAD_ONION_PORT, True)
-        check(res["success"], "addrman accepted the down configured onion as a tried address")
+        res = cfg.rpc("addpeeraddress", ONION_DOWN, DEAD_ONION_PORT, False)
+        check(res["success"], "addrman accepted the down configured onion as a known address")
         try:
             cfg.rpc("shunkobroadcast", r6["hex"], 1)
             message = ""
