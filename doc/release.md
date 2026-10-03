@@ -63,9 +63,13 @@ gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
 - The key may be pseudonymous (`triplecN`). What matters is that the same
   fingerprint is published in the repository, in the release notes and in the
   announcement, so a change is visible.
-- Before the first signed release, publish the release key fingerprint in this
-  file and in the release notes. Until it appears here, a
-  `SHA256SUMS.txt.asc` proves only that some key signed the checksum file.
+- The release key fingerprint is
+  `C29445AE6CB253E9785BDD26DC20C5AA5BD13CFB` (`CacheCoin (CCCN) Releases
+  <releases@cachecoin.org>`, expires 2029-10-02). The public key is
+  `release-key.asc` in the repository root, and the fingerprint is repeated in
+  the release notes. Compare it in both places before trusting a signature; a
+  `SHA256SUMS.txt.asc` alone proves only that some key signed the checksum
+  file.
 
 ## Current limits
 
