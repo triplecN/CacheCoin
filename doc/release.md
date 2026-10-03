@@ -64,12 +64,16 @@ gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
   fingerprint is published in the repository, in the release notes and in the
   announcement, so a change is visible.
 - The release key fingerprint is
-  `C29445AE6CB253E9785BDD26DC20C5AA5BD13CFB` (`CacheCoin (CCCN) Releases
+  `7D85B6F364CC47BA9209BB54F750900C7C911728` (`CacheCoin (CCCN) Releases
   <releases@cachecoin.org>`, expires 2029-10-02). The public key is
   `release-key.asc` in the repository root, and the fingerprint is repeated in
   the release notes. Compare it in both places before trusting a signature; a
   `SHA256SUMS.txt.asc` alone proves only that some key signed the checksum
   file.
+- A previous release key, `C29445AE6CB253E9785BDD26DC20C5AA5BD13CFB`, is
+  retired. Signatures made with it (the earlier drafts of the 0.1.0 Windows
+  package) remain verifiable with its public key, but new releases are signed
+  with the key above.
 
 ## Current limits
 
