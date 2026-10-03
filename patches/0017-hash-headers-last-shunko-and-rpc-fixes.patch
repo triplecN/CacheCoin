@@ -1,0 +1,321 @@
+From 8053e557d59a0582b0baa197491bbb33b42e1de1 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 17/20] network hardening: hash headers last, Shunko fixes, index/RPC
+ corrections
+
+net_processing: the cheap continuity, connect and claimed-work checks now run
+before any RandomX hashing. An unconnecting batch with no low-work sync in
+progress is a possible BIP130 announcement and is handled without hashing; a
+connecting batch whose claimed work is below the anti-DoS threshold and that is
+not full can never start a sync and is ignored. A low-work sync continuation is
+still hashed, as HeadersSyncState requires. A 200-header unconnecting replay
+now costs 0.00 s instead of several seconds of message-handler time.
+
+net_processing: the perticket rate limit drops silently instead of
+Misbehaving, so an honest burst or Tor bunching cannot get the relaying peer
+disconnected; tickets are not sent over or accepted from block-relay-only
+links.
+
+init: -coinstatsindex is refused with a clear error. The upstream index
+computes an unclaimed reward that goes negative on PER payout blocks and aborts
+the node at the first payout, again on every restart.
+
+rpc/mempool: Shunko never hands to this node's own address (global ::IsLocal),
+reports 'may have been delivered' when the tx bytes were already written, and
+the recent-target rotation is unchanged.
+
+shunko: a unix-socket proxy keeps its path (copy the whole Proxy), I2P targets
+are refused explicitly (IsTor), and the user agent is fixed.
+
+rpc/mining: getblocktemplate declares coinbasefee, reservoirfee and peroutputs,
+rewords coinbasevalue, and no longer advertises transactions/prevblock as
+freely mutable. mainnet_smoke now runs with -rpcdoccheck=1 so undeclared keys
+fail the suite.
+
+Tests: p2p_dos [8] unconnecting valid headers are not hashed; per_regtest [7]
+-coinstatsindex is refused; shunko [5b] a receiver that withholds the pong
+reports a possible delivery.
+---
+ src/init.cpp           |  9 ++++++++
+ src/net_processing.cpp | 47 ++++++++++++++++++++++++++++++++++++++++--
+ src/rpc/client.cpp     |  2 ++
+ src/rpc/mempool.cpp    | 14 +++++++++++++
+ src/rpc/mining.cpp     | 20 ++++++++++++++----
+ src/shunko.cpp         | 18 +++++++++++-----
+ src/shunko.h           |  3 +++
+ 7 files changed, 102 insertions(+), 11 deletions(-)
+
+diff --git a/src/init.cpp b/src/init.cpp
+index 449b187..5ef5669 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1015,6 +1015,15 @@ bool AppInitParameterInteraction(const ArgsManager& args)
+         return InitError(Untranslated("CacheCoin does not support -prune: PER consensus needs full block history to verify epoch payouts."));
+     }
+ 
++    // CacheCoin PER: the upstream coinstats index computes this block's
++    // "unclaimed reward" as fees minus coinbase outputs and asserts that it fits
++    // an int64. Under PER a payout block can make that value negative, which
++    // aborts the node (and it aborts again on every restart that reaches the
++    // height). Refuse the option until the index learns the reservoir.
++    if (args.GetBoolArg("-coinstatsindex", false)) {
++        return InitError(Untranslated("CacheCoin does not support -coinstatsindex yet: its supply accounting does not know the PER reservoir."));
++    }
++
+     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
+     if (args.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED) && !args.GetBoolArg("-dnsseed", DEFAULT_DNSSEED)){
+         return InitError(_("Cannot set -forcednsseed to true when setting -dnsseed to false."));
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index a376c97..4818a0f 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -2293,7 +2293,9 @@ void PeerManagerImpl::InitiateTxBroadcastPrivate(const CTransactionRef& tx)
+ void PeerManagerImpl::RelayPerTicket(const PerTicket& ticket)
+ {
+     m_connman.ForEachNode([this, &ticket](CNode* pnode) {
+-        if (pnode->fSuccessfullyConnected) {
++        // Same rule as transaction relay: block-relay-only links exist to hide
++        // that we are the origin, so a ticket must not cross them.
++        if (pnode->fSuccessfullyConnected && !pnode->IsBlockOnlyConn() && pnode->m_relays_txs) {
+             MakeAndPushMessage(*pnode, NetMsgType::PERTICKET, ticket);
+         }
+     });
+@@ -3016,6 +3018,40 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
+         return;
+     }
+ 
++    // CacheCoin: the cheap checks run before any RandomX hashing. Hashing 2000
++    // unknown headers costs tens of seconds of message-handler time, so a peer
++    // must not be able to force it with headers that are then discarded:
++    //  - a batch that connects to nothing and is not part of a low-work sync in
++    //    progress is a possible BIP130 announcement, handled without hashing;
++    //  - a connecting batch whose claimed work is below the anti-DoS threshold
++    //    and that is not full can never start a sync, so it is ignored.
++    // Everything else is hashed below; a low-work sync continuation must be.
++    if (!CheckHeadersAreContinuous(headers)) {
++        Misbehaving(peer, "non-continuous headers sequence");
++        return;
++    }
++    {
++        const CBlockIndex* chain_start{WITH_LOCK(cs_main, return m_chainman.m_blockman.LookupBlockIndex(headers[0].hashPrevBlock))};
++        bool in_presync{false};
++        {
++            LOCK(peer.m_headers_sync_mutex);
++            in_presync = peer.m_headers_sync != nullptr;
++        }
++        if (chain_start == nullptr && !in_presync) {
++            HandleUnconnectingHeaders(pfrom, peer, headers);
++            return;
++        }
++        if (chain_start != nullptr && !in_presync) {
++            const arith_uint256 total_work{chain_start->nChainWork + CalculateClaimedHeadersWork(headers)};
++            if (total_work < GetAntiDoSWorkThreshold() && headers.size() != m_opts.max_headers_result) {
++                LogDebug(BCLog::NET, "Ignoring low-work chain (height=%u) from peer=%d\n",
++                         chain_start->nHeight + headers.size(), pfrom.GetId());
++                peer.m_last_getheaders_timestamp = {};
++                return;
++            }
++        }
++    }
++
+     // Before we do any processing, make sure these pass basic sanity checks.
+     // We'll rely on headers having valid proof-of-work further down, as an
+     // anti-DoS criteria (note: this check is required before passing any
+@@ -4987,6 +5023,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+             Misbehaving(peer, "oversized perticket");
+             return;
+         }
++        // A ticket over a block-relay-only link would leak that link's existence;
++        // drop it silently. Do not filter on the peer's relay flag: -blocksonly
++        // ticket miners are honest and must still be able to send tickets.
++        if (pfrom.IsBlockOnlyConn()) return;
+         PerTicket ticket;
+         vRecv >> ticket;
+         // Lock-free sanity first: payout must be a spendable small script.
+@@ -5023,7 +5063,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+             }
+             peer.m_per_ticket_last = now;
+             if (peer.m_per_ticket_tokens < 1.0) {
+-                Misbehaving(peer, "perticket flood");
++                // Drop silently. An honest burst (or Tor bunching) can exceed the
++                // bucket, and disconnecting the relaying peer punishes the relay,
++                // not the flooder; the ticket is only lost for this peer.
++                LogDebug(BCLog::NET, "perticket rate limit, dropping (peer=%d)\n", peer.m_id);
+                 return;
+             }
+             peer.m_per_ticket_tokens -= 1.0;
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 32da956..011ad0a 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -165,6 +165,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "signrawtransactionwithwallet", 1, "prevtxs" },
+     { "sendrawtransaction", 1, "maxfeerate" },
+     { "sendrawtransaction", 2, "maxburnamount" },
++    { "generateperticket", 0, "address" },
++    { "generateperticket", 1, "maxtries" },
+     { "shunkobroadcast", 1, "peers" },
+     { "shunkobroadcast", 2, "targets" },
+     { "shunkobroadcast", 3, "maxfeerate" },
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 7a9ae37..d4f732e 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -255,6 +255,11 @@ static RPCHelpMan shunkobroadcast()
+                 });
+             };
+             const auto add = [&](const CService& s) {
++                // Never hand to this node's own address. The Shunko socket is not a
++                // CNode, so the node would accept its own transaction and announce it
++                // to every long-lived peer. The global ::IsLocal knows this node's own
++                // onion once -externalip or Tor control registered it.
++                if (::IsLocal(s)) return;
+                 if (s.IsValid() && std::find(candidates.begin(), candidates.end(), s) == candidates.end()) candidates.push_back(s);
+             };
+             if (!request.params[2].isNull()) {
+@@ -337,6 +342,7 @@ static RPCHelpMan shunkobroadcast()
+             std::string first_error;
+             size_t next{0};
+             std::vector<CService> used;
++            bool any_written{false};
+             for (int round = 0; round < 2 && delivered < peers && next < candidates.size(); ++round) {
+                 std::vector<std::future<std::vector<ShunkoDelivery>>> jobs;
+                 for (int i = delivered; i < peers && next < candidates.size(); ++i) {
+@@ -357,6 +363,7 @@ static RPCHelpMan shunkobroadcast()
+                             if (first_error.empty()) first_error = r.error;
+                         }
+                         attempts.push_back(a);
++                        if (r.tx_written) any_written = true;
+                         if (r.delivered) ++delivered;
+                     }
+                 }
+@@ -369,6 +376,13 @@ static RPCHelpMan shunkobroadcast()
+                 }
+             }
+             if (delivered == 0) {
++                if (any_written) {
++                    // The tx bytes reached a socket before the attempt failed, so the
++                    // node may have processed it. Telling the user "not sent" would
++                    // invite a second payment for the same debt.
++                    throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED,
++                        "No node confirmed the hand-over, but the transaction was already written to at least one node and may have been delivered. Do not rebuild the payment: retry the same raw transaction with shunkobroadcast, or check the targets' mempools. (" + first_error + ")");
++                }
+                 throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, "No node could be reached; the transaction was not sent (" + first_error + ")");
+             }
+             UniValue ret(UniValue::VOBJ);
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 8d79c4d..060c1e4 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -688,13 +688,23 @@ static RPCHelpMan getblocktemplate()
+                 {
+                     {RPCResult::Type::STR_HEX, "key", "values must be in the coinbase (keys may be ignored)"},
+                 }},
+-                {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to coinbase transaction, including the generation award and transaction fees (in satoshis)"},
++                {RPCResult::Type::NUM, "coinbasevalue", "value of the coinbase's first output: the subsidy plus the miner's share of the block fees (fees - floor(fees/2)), in satoshis. Reservoir payouts are separate outputs in 'peroutputs'."},
++                {RPCResult::Type::NUM, "coinbasefee", "the miner's share of this block's fees (fees - floor(fees/2)), in satoshis"},
++                {RPCResult::Type::NUM, "reservoirfee", "the PER reservoir's share of this block's fees (floor(fees/2)), in satoshis"},
++                {RPCResult::Type::ARR, "peroutputs", "mandatory coinbase outputs after the first, in order: the PER commitment at vout 1, then the ticket records, then the reservoir payouts. A miner that changes the transaction set must recompute the commitment (the pool changes by the new floor(fees/2)) or the block is rejected with bad-cb-per-state.",
++                {
++                    {RPCResult::Type::OBJ, "", "",
++                    {
++                        {RPCResult::Type::NUM, "value", "output value in satoshis (0 for the commitment and ticket records)"},
++                        {RPCResult::Type::STR_HEX, "script", "output script in hex"},
++                    }},
++                }},
+                 {RPCResult::Type::STR, "longpollid", "an id to include with a request to longpoll on an update to this template"},
+                 {RPCResult::Type::STR, "target", "The hash target"},
+                 {RPCResult::Type::NUM_TIME, "mintime", "The minimum timestamp appropriate for the next block time, expressed in " + UNIX_EPOCH_TIME + ". Adjusted for the proposed BIP94 timewarp rule."},
+                 {RPCResult::Type::ARR, "mutable", "list of ways the block template may be changed",
+                 {
+-                    {RPCResult::Type::STR, "value", "A way the block template may be changed, e.g. 'time', 'transactions', 'prevblock'"},
++                    {RPCResult::Type::STR, "value", "A way the block template may be changed, e.g. 'time', 'coinbasevalue', 'peroutputs'"},
+                 }},
+                 {RPCResult::Type::STR_HEX, "noncerange", "A range of valid nonces"},
+                 {RPCResult::Type::NUM, "sigoplimit", "limit of sigops in blocks"},
+@@ -954,8 +964,10 @@ static RPCHelpMan getblocktemplate()
+ 
+     UniValue aMutable(UniValue::VARR);
+     aMutable.push_back("time");
+-    aMutable.push_back("transactions");
+-    aMutable.push_back("prevblock");
++    // "transactions" and "prevblock" are deliberately absent: the PER commitment
++    // pins floor(fees/2) and the block's parent, so changing the transaction set
++    // requires recomputing the commitment, and changing the parent invalidates
++    // the whole template. Advertising them as freely mutable was wrong.
+ 
+     UniValue result(UniValue::VOBJ);
+     result.pushKV("capabilities", std::move(aCaps));
+diff --git a/src/shunko.cpp b/src/shunko.cpp
+index bccd7aa..698fb0f 100644
+--- a/src/shunko.cpp
++++ b/src/shunko.cpp
+@@ -115,15 +115,18 @@ std::vector<unsigned char> VersionPayload(int start_height)
+     return p;
+ }
+ 
+-void DeliverOne(const CTransaction& tx, const CService& target, const MessageStartChars& magic, int start_height, Deadline deadline)
++void DeliverOne(const CTransaction& tx, const CService& target, const MessageStartChars& magic, int start_height, Deadline deadline, bool& tx_written)
+ {
+     std::unique_ptr<Sock> sock;
+     Proxy proxy;
+     if (GetProxy(target.GetNetwork(), proxy)) {
+         // Isolated-stream SOCKS5 credentials: a fresh circuit per connection *if*
+         // the proxy isolates streams by auth (Tor does with IsolateSOCKSAuth).
+-        // With a generic SOCKS proxy the streams may share a circuit.
+-        const Proxy isolated{proxy.proxy, /*tor_stream_isolation=*/true};
++        // With a generic SOCKS proxy the streams may share a circuit. Copy the
++        // whole Proxy: rebuilding it from proxy.proxy drops the unix-socket path
++        // and silently disables Shunko for proxy=unix:.
++        Proxy isolated{proxy};
++        isolated.m_tor_stream_isolation = true;
+         bool proxy_failed{false};
+         sock = ConnectThroughProxy(isolated, target.ToStringAddr(), target.GetPort(), proxy_failed);
+         if (!sock) throw std::runtime_error(proxy_failed ? "proxy (Tor) not reachable" : "could not connect through the proxy");
+@@ -156,6 +159,9 @@ void DeliverOne(const CTransaction& tx, const CService& target, const MessageSta
+     ss << TX_WITH_WITNESS(tx);
+     const std::vector<unsigned char> tx_bytes{UCharCast(ss.data()), UCharCast(ss.data() + ss.size())};
+     send(NetMsgType::TX, tx_bytes);
++    // From here on the peer may have the transaction even if the pong never
++    // arrives; the caller must report that honestly.
++    tx_written = true;
+ 
+     // Messages are processed in order: the pong proves the transaction was processed.
+     std::vector<unsigned char> ping;
+@@ -178,7 +184,9 @@ bool ShunkoTargetIsPrivate(const CService& target)
+     // to, and a global -proxy is configured for all of them. A clearnet IPv4
+     // target therefore passed the old check and the hand-over went out through a
+     // Tor exit, which is an observer with no reason to protect the sender.
+-    if (!target.IsPrivacyNet()) return false;
++    // Only Tor: there is no I2P transport path in this node, so an I2P target
++    // would only fail after a SOCKS5 handshake against the SAM bridge.
++    if (!target.IsTor()) return false;
+     Proxy proxy;
+     return GetProxy(target.GetNetwork(), proxy);
+ }
+@@ -192,7 +200,7 @@ std::vector<ShunkoDelivery> ShunkoDeliver(const CTransaction& tx, const std::vec
+         ShunkoDelivery r;
+         r.target = target.ToStringAddrPort();
+         try {
+-            DeliverOne(tx, target, params.MessageStart(), start_height, std::chrono::steady_clock::now() + timeout);
++            DeliverOne(tx, target, params.MessageStart(), start_height, std::chrono::steady_clock::now() + timeout, r.tx_written);
+             r.delivered = true;
+         } catch (const std::exception& e) {
+             r.error = e.what();
+diff --git a/src/shunko.h b/src/shunko.h
+index e881c84..1547544 100644
+--- a/src/shunko.h
++++ b/src/shunko.h
+@@ -29,6 +29,9 @@ class CChainParams;
+ struct ShunkoDelivery {
+     std::string target;
+     bool delivered{false};
++    /** The tx message reached the socket. If a later step failed, the node may
++     *  still have processed it, so the caller must not tell the user "not sent". */
++    bool tx_written{false};
+     std::string error;
+ };
+ 
+-- 
+2.53.0.windows.3
+

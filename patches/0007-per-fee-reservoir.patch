@@ -1,0 +1,1609 @@
+From e9ab1e320e8cd1ed8d43fff1a355590678d5ea1b Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 07/20] PER fee reservoir
+
+Half of every fee goes into a 28-day reservoir paid to entropy tickets.
+Tickets are RandomX proofs at 1/16 of the block target, relayed with the
+perticket message and committed in the coinbase.
+---
+ src/CMakeLists.txt         |   1 +
+ src/consensus/params.h     |   8 +
+ src/init.cpp               |   6 +
+ src/kernel/chainparams.cpp |   7 +
+ src/net_processing.cpp     | 132 ++++++-
+ src/net_processing.h       |   4 +
+ src/node/miner.cpp         |  54 ++-
+ src/per.cpp                | 739 +++++++++++++++++++++++++++++++++++++
+ src/per.h                  | 163 ++++++++
+ src/protocol.h             |   6 +
+ src/rpc/mining.cpp         | 169 ++++++++-
+ src/validation.cpp         |  25 +-
+ 12 files changed, 1303 insertions(+), 11 deletions(-)
+ create mode 100644 src/per.cpp
+ create mode 100644 src/per.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a99d335..12761d2 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -237,6 +237,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
+   node/utxo_snapshot.cpp
+   node/warnings.cpp
+   noui.cpp
++  per.cpp
+   policy/ephemeral_policy.cpp
+   policy/fees/block_policy_estimator.cpp
+   policy/fees/block_policy_estimator_args.cpp
+diff --git a/src/consensus/params.h b/src/consensus/params.h
+index 93ee071..ec7dd16 100644
+--- a/src/consensus/params.h
++++ b/src/consensus/params.h
+@@ -84,6 +84,14 @@ struct BIP9Deployment {
+ struct Params {
+     uint256 hashGenesisBlock;
+     int nSubsidyHalvingInterval;
++    /** CacheCoin PER: blocks per reservoir epoch (40,320 = 28 days of 60 s blocks) */
++    int nPerEpochBlocks{40320};
++    /** CacheCoin PER: a ticket's proof-of-work target is its block target times this */
++    uint32_t nPerTicketTargetMultiplier{16};
++    /** CacheCoin PER: a ticket built on block R may be included in blocks R+1 .. R+window */
++    int nPerTicketWindow{10};
++    /** CacheCoin PER: most tickets one block may include */
++    unsigned int nPerMaxBlockTickets{64};
+     /**
+      * Hashes of blocks that
+      * - are known to be consensus valid, and
+diff --git a/src/init.cpp b/src/init.cpp
+index c092a19..449b187 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1007,6 +1007,12 @@ bool AppInitParameterInteraction(const ArgsManager& args)
+         if (args.GetBoolArg("-reindex-chainstate", false)) {
+             return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
+         }
++        // CacheCoin PER: epoch payouts read blocks up to one epoch (40,320
++        // blocks) back from disk, far beyond the prune window. A pruned node
++        // would reject valid payout blocks and split from the network, so
++        // pruning is refused outright. This subsumes the checks above, but
++        // they are kept so the more specific diagnostic still wins.
++        return InitError(Untranslated("CacheCoin does not support -prune: PER consensus needs full block history to verify epoch payouts."));
+     }
+ 
+     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 62579a9..67608ef 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -111,6 +111,12 @@ public:
+         m_chain_type = ChainType::MAIN;
+         consensus.signet_blocks = false;
+         consensus.signet_challenge.clear();
++        // PER: half of all fees go into a 28-day reservoir, divided among the tickets
++        // (hashes at 1/16 of the block difficulty) that the epoch's blocks included.
++        consensus.nPerEpochBlocks = 40320;           // 28 days of 60 s blocks
++        consensus.nPerTicketTargetMultiplier = 16;
++        consensus.nPerTicketWindow = 10;
++        consensus.nPerMaxBlockTickets = 64;
+         consensus.nSubsidyHalvingInterval = 1051200; // ~2 years of 60 s blocks
+         // CacheCoin starts with every soft fork Bitcoin accumulated already active
+         // (BIP34/65/66, CSV, SegWit, Taproot), so native SegWit (cccn1...) outputs are
+@@ -557,6 +563,7 @@ public:
+         consensus.signet_blocks = false;
+         consensus.signet_challenge.clear();
+         consensus.nSubsidyHalvingInterval = 150;
++        consensus.nPerEpochBlocks = 20; // short PER epochs so tests reach the payouts
+         consensus.BIP34Height = 1; // Always active unless overridden
+         consensus.BIP34Hash = uint256();
+         consensus.BIP65Height = 1;  // Always active unless overridden
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index ea6c8b8..437b054 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -51,6 +51,7 @@
+ #include <script/script.h>
+ #include <serialize.h>
+ #include <span.h>
++#include <per.h>
+ #include <streams.h>
+ #include <sync.h>
+ #include <tinyformat.h>
+@@ -248,6 +249,11 @@ struct Peer {
+     /** Services this peer offered to us. */
+     std::atomic<ServiceFlags> m_their_services{NODE_NONE};
+ 
++    /** CacheCoin PER: token bucket limiting how many perticket messages we verify from this
++     *  peer (each costs one RandomX hash). Refilled over time; guarded by cs_main. */
++    double m_per_ticket_tokens GUARDED_BY(::cs_main){16};
++    std::chrono::microseconds m_per_ticket_last GUARDED_BY(::cs_main){0};
++
+     //! Whether this peer is an inbound connection
+     const bool m_is_inbound;
+ 
+@@ -550,6 +556,7 @@ public:
+     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void InitiateTxBroadcastToAll(const Txid& txid, const Wtxid& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void InitiateTxBroadcastPrivate(const CTransactionRef& tx) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
++    void RelayPerTicket(const PerTicket& ticket) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void SetBestBlock(int height, std::chrono::seconds time) override
+     {
+         m_best_height = height;
+@@ -2279,6 +2286,17 @@ void PeerManagerImpl::InitiateTxBroadcastPrivate(const CTransactionRef& tx)
+     }
+ }
+ 
++void PeerManagerImpl::RelayPerTicket(const PerTicket& ticket)
++{
++    m_connman.ForEachNode([this, &ticket](CNode* pnode) {
++        if (pnode->fSuccessfullyConnected) {
++            // v31.1 port: CNetMsgMaker is gone; MakeAndPushMessage wraps NetMsg::Make,
++            // which handles the node's negotiated version itself.
++            MakeAndPushMessage(*pnode, NetMsgType::PERTICKET, ticket);
++        }
++    });
++}
++
+ void PeerManagerImpl::RelayAddress(NodeId originator,
+                                    const CAddress& addr,
+                                    bool fReachable)
+@@ -4911,26 +4929,132 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+         bool forceProcessing = false;
+         const uint256 hash(pblock->GetHash());
+         bool min_pow_checked = false;
++        bool unrequested_new_header = false;
+         {
+             LOCK(cs_main);
+             // Always process the block if we requested it, since we may
+             // need it even when it's not a candidate for a new best tip.
+             forceProcessing = IsBlockRequested(hash);
+             RemoveBlockRequest(hash, pfrom.GetId());
+-            // mapBlockSource is only used for punishing peers and setting
+-            // which peers send us compact blocks, so the race between here and
+-            // cs_main in ProcessNewBlock is fine.
+-            mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
++            unrequested_new_header = !forceProcessing && !m_chainman.m_blockman.LookupBlockIndex(hash);
+ 
+             // Check claimed work on this block against our anti-dos thresholds.
+             if (prev_block && prev_block->nChainWork + GetBlockProof(*pblock) >= GetAntiDoSWorkThreshold()) {
+                 min_pow_checked = true;
+             }
++            // mapBlockSource is only used for punishing peers and setting
++            // which peers send us compact blocks, so the race between here and
++            // cs_main in ProcessNewBlock is fine.
++            if (!unrequested_new_header) mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
++        }
++        if (unrequested_new_header) {
++            // CacheCoin: checking a new header's RandomX proof of work costs milliseconds, and
++            // ProcessNewBlock would do it while holding cs_main. First drop, without hashing,
++            // what ProcessNewBlock would reject anyway (unknown parent: missing-prev, 10 points;
++            // too little work: low-work header, no penalty). Then check the proof of work here,
++            // outside cs_main; a pass is cached, so ProcessNewBlock does not hash it again.
++            if (!prev_block) {
++                Misbehaving(peer, "block with unknown parent");
++                return;
++            }
++            if (!min_pow_checked) {
++                LogDebug(BCLog::NET, "Ignoring low-work unrequested block %s from peer=%d\n", hash.ToString(), pfrom.GetId());
++                return;
++            }
++            // v31.1 port: CBlock now derives from CBlockHeader (no GetBlockHeader()), and
++            // HasValidProofOfWork takes a span of headers.
++            const CBlockHeader header{*pblock};
++            if (!HasValidProofOfWork(std::span<const CBlockHeader>{&header, 1}, m_chainparams.GetConsensus())) {
++                Misbehaving(peer, "block with invalid proof of work");
++                return;
++            }
++            WITH_LOCK(cs_main, mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true)));
+         }
+         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+         return;
+     }
+ 
++    if (msg_type == NetMsgType::PERTICKET) {
++        // CacheCoin PER: one entropy ticket from a peer. Verifying its proof of work costs a
++        // RandomX hash (~20 ms), which must NEVER run under cs_main: that lock stalls block
++        // connect, mempool, RPC and scheduler (see 0004, which checks headers outside it).
++        // So: cheap checks + chain snapshot under a brief lock, hash with no lock held,
++        // then re-check under lock (the tip may have moved while hashing). Valid, new
++        // tickets are pooled and relayed onward (see per.h).
++        PerTicket ticket;
++        vRecv >> ticket;
++        // Lock-free sanity first: payout must be a spendable small script.
++        if (!PerPayoutScriptAllowed(ticket.payout)) {
++            Misbehaving(peer, "invalid perticket payout");
++            return;
++        }
++        // Snapshot under a brief lock: token bucket, tip, and anchor data.
++        uint32_t anchor_nbits{0};
++        {
++            LOCK(cs_main);
++            constexpr double refill_per_second{8.0}, bucket_max{16.0};
++            const auto now{GetTime<std::chrono::microseconds>()};
++            if (peer.m_per_ticket_last.count() != 0) {
++                // Clamp: a backward clock slew must not stall the bucket, and a
++                // forward jump can only refill up to the cap anyway.
++                const double raw_elapsed{Ticks<SecondsDouble>(now - peer.m_per_ticket_last)};
++                const double elapsed{raw_elapsed < 0 ? 0 : raw_elapsed};
++                peer.m_per_ticket_tokens = std::min(bucket_max, peer.m_per_ticket_tokens + elapsed * refill_per_second);
++            }
++            peer.m_per_ticket_last = now;
++            if (peer.m_per_ticket_tokens < 1.0) {
++                Misbehaving(peer, "perticket flood");
++                return;
++            }
++            peer.m_per_ticket_tokens -= 1.0;
++            if (PerPoolSize() >= 10000) {
++                // Relay-only nodes never template or mine, so nothing else
++                // sweeps for them: one sweep before dropping, or stale tickets
++                // wedge the pool forever.
++                PerPoolSweep(m_chainman.ActiveChain().Tip(), m_chainman.m_blockman, m_chainman.GetConsensus());
++                if (PerPoolSize() >= 10000) {
++                    LogDebug(BCLog::NET, "dropping perticket: pool full\n");
++                    return;
++                }
++            }
++            if (PerPoolHas(ticket.Id())) return; // already have it; do not re-verify or loop
++            const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
++            if (!tip) return;
++            const CBlockIndex* anchorIdx{m_chainman.m_blockman.LookupBlockIndex(ticket.anchor)};
++            // No ban here: an anchor we don't know (or not on our chain) may be
++            // a normal fork race, indistinguishable from malice. Objectively
++            // invalid tickets (bad payout above, bad PoW below) are still punished.
++            if (!anchorIdx || anchorIdx->nHeight > tip->nHeight ||
++                tip->GetAncestor(anchorIdx->nHeight) != anchorIdx) {
++                return;
++            }
++            const int diff{tip->nHeight - anchorIdx->nHeight};
++            if (diff < 0 || diff >= m_chainman.GetConsensus().nPerTicketWindow) {
++                return;
++            }
++            anchor_nbits = anchorIdx->nBits;
++        }
++        // Expensive RandomX hash with NO lock held.
++        if (!PerTicketPowValid(ticket, anchor_nbits, m_chainman.GetConsensus())) {
++            Misbehaving(peer, "invalid perticket proof of work");
++            return;
++        }
++        // Re-check under lock: tip may have moved and another thread may have
++        // pooled this ticket while we hashed. Then pool + relay.
++        {
++            LOCK(cs_main);
++            const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
++            if (!tip) return;
++            const CBlockIndex* anchorIdx{m_chainman.m_blockman.LookupBlockIndex(ticket.anchor)};
++            if (!anchorIdx || tip->GetAncestor(anchorIdx->nHeight) != anchorIdx) return;
++            const int diff2{tip->nHeight - anchorIdx->nHeight};
++            if (diff2 < 0 || diff2 >= m_chainman.GetConsensus().nPerTicketWindow) return;
++            if (PerPoolHas(ticket.Id())) return;
++            if (PerPoolAdd(ticket)) RelayPerTicket(ticket);
++            return;
++        }
++    }
++
+     if (msg_type == NetMsgType::GETADDR) {
+         // This asymmetric behavior for inbound and outbound connections was introduced
+         // to prevent a fingerprinting attack: an attacker can send specific fake addresses
+diff --git a/src/net_processing.h b/src/net_processing.h
+index 36ae021..a70cb6d 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -9,6 +9,7 @@
+ #include <consensus/amount.h>
+ #include <net.h>
+ #include <node/txorphanage.h>
++#include <per.h>
+ #include <private_broadcast.h>
+ #include <protocol.h>
+ #include <threadsafety.h>
+@@ -149,6 +150,9 @@ public:
+      */
+     virtual void InitiateTxBroadcastPrivate(const CTransactionRef& tx) = 0;
+ 
++    /** CacheCoin PER: relay one entropy ticket to all peers (used after mining one locally). */
++    virtual void RelayPerTicket(const PerTicket& ticket) = 0;
++
+     /** Send ping message to all peers */
+     virtual void SendPings() = 0;
+ 
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 7ea8d10..e2edaa1 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -20,6 +20,7 @@
+ #include <node/kernel_notifications.h>
+ #include <policy/feerate.h>
+ #include <policy/policy.h>
++#include <per.h>
+ #include <pow.h>
+ #include <primitives/transaction.h>
+ #include <util/moneystr.h>
+@@ -147,6 +148,36 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
+     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
+     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
+ 
++    // CacheCoin PER: gather the entropy tickets to embed and the payout outputs for the
++    // tickets embedded one epoch ago (both independent of this block's fees), and reserve
++    // their weight before filling the block with mempool transactions (see per.h).
++    const Consensus::Params& per_consensus = chainparams.GetConsensus();
++    const auto prev_per{GetPerState(pindexPrev, m_chainstate.m_blockman)};
++    if (!prev_per) throw std::runtime_error("CreateNewBlock: cannot read the PER state of the tip");
++    std::vector<PerTicket> per_tickets = PerPoolCollect(pindexPrev, m_chainstate.m_blockman, per_consensus);
++    std::vector<CTxOut> per_extra_outs;
++    for (const auto& t : per_tickets) per_extra_outs.push_back(PerTicketOutput(t));
++    const CAmount per_rate = PerNextState(*prev_per, nHeight, 0, 0, per_consensus).rate;
++    const int per_src_height = nHeight - per_consensus.nPerEpochBlocks;
++    if (per_src_height >= 1 && per_rate > 0) {
++        if (const CBlockIndex* src = pindexPrev->GetAncestor(per_src_height)) {
++            auto src_tickets = PerBlockTickets(src, m_chainstate.m_blockman);
++            if (!src_tickets) throw std::runtime_error("CreateNewBlock: cannot read the PER payout source block");
++            for (const auto& t : *src_tickets) per_extra_outs.emplace_back(per_rate, t.payout);
++        }
++    }
++    const uint16_t per_block_tickets = static_cast<uint16_t>(per_tickets.size());
++    const uint16_t per_payout_count = static_cast<uint16_t>(per_extra_outs.size() - per_tickets.size());
++    // Reserve weight for the commitment plus these outputs so the block cannot exceed its limit.
++    // m_options.block_reserved_weight only covers the header, the tx count and the coinbase's
++    // own dummy output, so these extra coinbase outputs have to be charged to the budget here,
++    // before addChunks() fills the rest of the block.
++    // GetSerializeSize() no longer takes a protocol version; the one-argument
++    // form is the plain non-witness size.
++    size_t per_extra_bytes = ::GetSerializeSize(PerCommitmentOutput(PerCommitment{}));
++    for (const auto& o : per_extra_outs) per_extra_bytes += ::GetSerializeSize(o);
++    nBlockWeight += per_extra_bytes * WITNESS_SCALE_FACTOR;
++
+     if (m_mempool) {
+         LOCK(m_mempool->cs);
+         m_mempool->StartBlockBuilding();
+@@ -174,11 +205,30 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
+     // Add an output that spends the full coinbase reward.
+     coinbaseTx.vout.resize(1);
+     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
+-    // Block subsidy + fees
+-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
++    // CacheCoin PER: the miner takes the subsidy and fees - fees/2; fees/2 go to the epoch
++    // reservoir, whose new state is committed in the next output (see per.h). ConnectBlock
++    // allows (nFees - PerFeeShare(nFees)) + subsidy + this block's reservoir payouts, so the
++    // payout outputs below are what funds those, not extra money.
++    const CAmount block_reward{(nFees - PerFeeShare(nFees)) + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+     coinbaseTx.vout[0].nValue = block_reward;
+     coinbase_tx.block_reward_remaining = block_reward;
+ 
++    // The commitment (with fees now known), then the ticket records, then the payout outputs.
++    // They are appended before GenerateCoinbaseCommitment() below so that the witness
++    // commitment stays the very last output, and the consensus-mandated vout indices hold:
++    // vout[1] = commitment, vout[2 .. 2+block_tickets) = tickets, then the payouts.
++    PerCommitment per;
++    per.state = PerNextState(*prev_per, nHeight, nFees, per_block_tickets, per_consensus);
++    per.block_tickets = per_block_tickets;
++    per.payouts = per_payout_count;
++    coinbaseTx.vout.push_back(PerCommitmentOutput(per));
++    for (const auto& o : per_extra_outs) coinbaseTx.vout.push_back(o);
++    // Mirror them into the CoinbaseTx description mining clients build from. They are pushed
++    // before the witness commitment (added below), so required_outputs keeps the same order
++    // as the real coinbase's vout[1..].
++    coinbase_tx.required_outputs.push_back(PerCommitmentOutput(per));
++    for (const auto& o : per_extra_outs) coinbase_tx.required_outputs.push_back(o);
++
+     // Start the coinbase scriptSig with the block height as required by BIP34.
+     // Mining clients are expected to append extra data to this prefix, so
+     // increasing its length would reduce the space they can use and may break
+diff --git a/src/per.cpp b/src/per.cpp
+new file mode 100644
+index 0000000..3b2068b
+--- /dev/null
++++ b/src/per.cpp
+@@ -0,0 +1,739 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <per.h>
++
++#include <arith_uint256.h>
++#include <chain.h>
++#include <consensus/params.h>
++#include <crypto/randomx_wrapper.h>
++#include <hash.h>
++#include <node/blockstorage.h>
++#include <primitives/block.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <validation.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cstring>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <set>
++
++namespace {
++
++// "PER\x01" + <qIqHH> (pool int64, tickets uint32, rate int64,
++// block_tickets u16, payouts u16) = 28 bytes. Script is OP_RETURN + push 28,
++// so its hex starts with 6a1c50455201 (see tests/functional_regtest.py).
++constexpr size_t PER_COMMIT_DATA_SIZE{28};
++// "PERT" + anchor(32) + payout script + nonce u32. The hex contains 50455254
++// and the payout script, so ticket relay tests can match on substrings.
++constexpr size_t PER_TICKET_OVERHEAD{4 + 32 + 4};
++// Global pool cap: tickets cost nothing to create, so never verify or hold
++// unbounded input from the network.
++constexpr size_t PER_POOL_MAX{10000};
++
++void AppendLE64(std::vector<unsigned char>& v, int64_t x)
++{
++    uint64_t u{static_cast<uint64_t>(x)};
++    for (int i = 0; i < 8; ++i) v.push_back(static_cast<unsigned char>((u >> (8 * i)) & 0xff));
++}
++
++void AppendLE32(std::vector<unsigned char>& v, uint32_t x)
++{
++    for (int i = 0; i < 4; ++i) v.push_back(static_cast<unsigned char>((x >> (8 * i)) & 0xff));
++}
++
++void AppendLE16(std::vector<unsigned char>& v, uint16_t x)
++{
++    v.push_back(static_cast<unsigned char>(x & 0xff));
++    v.push_back(static_cast<unsigned char>((x >> 8) & 0xff));
++}
++
++// NOTE: little-endian reads use Bitcoin Core's crypto/common.h helpers
++// (uint64_t ReadLE64, uint32_t ReadLE32, uint16_t ReadLE16); local copies
++// were removed because identical signatures made every call ambiguous.
++
++// CRIT-32: validated ticket-PoW ids, bounded. The verdict is a pure function
++// of ticket content + anchor difficulty (both immutable), so hits are exact.
++// Caps the per-block re-hash cost (64 tickets) during IBD and template builds.
++constexpr size_t PER_POW_CACHE_MAX{8192};
++std::mutex g_pow_mutex;
++std::set<uint256> g_pow_valid;
++std::deque<uint256> g_pow_order;
++
++/** Ticket proof-of-work target: anchor block target times the multiplier. */
++arith_uint256 TicketTarget(uint32_t anchor_nbits, uint32_t multiplier)
++{
++    arith_uint256 t;
++    bool neg{false}, over{false};
++    t.SetCompact(anchor_nbits, &neg, &over);
++    if (neg || over || t == 0) return arith_uint256{0};
++    if (multiplier <= 1) return t;
++    const arith_uint256 orig{t};
++    t *= multiplier;
++    // On overflow saturate to the maximum target (every hash passes).
++    if (t / multiplier != orig) return ~arith_uint256{0};
++    return t;
++}
++
++/** RandomX(anchor || payout || nonce) as a uint256 (little-endian). */
++uint256 TicketPowHash(const PerTicket& t)
++{
++    std::vector<unsigned char> data;
++    data.reserve(32 + t.payout.size() + 4);
++    data.insert(data.end(), t.anchor.begin(), t.anchor.end());
++    data.insert(data.end(), t.payout.begin(), t.payout.end());
++    AppendLE32(data, t.nonce);
++    std::vector<uint8_t> out{
++        RandomXEngine::GetInstance().CalculateHash(data.data(), data.size())};
++    uint256 h;
++    if (out.size() >= 32) std::memcpy(h.begin(), out.data(), 32);
++    return h;
++}
++
++/** Ticket PoW verdict, cached (pure function of content). */
++bool PerTicketPowPass(const PerTicket& ticket, uint32_t anchor_nbits,
++                      const Consensus::Params& params)
++{
++    const uint256 tid{ticket.Id()};
++    {
++        std::lock_guard<std::mutex> lock{g_pow_mutex};
++        if (g_pow_valid.count(tid)) return true;
++    }
++    const arith_uint256 target{
++        TicketTarget(anchor_nbits, params.nPerTicketTargetMultiplier)};
++    if (target == 0) return false;
++    if (UintToArith256(TicketPowHash(ticket)) > target) return false;
++    {
++        std::lock_guard<std::mutex> lock{g_pow_mutex};
++        if (g_pow_valid.insert(tid).second) {
++            g_pow_order.push_back(tid);
++            while (g_pow_order.size() > PER_POW_CACHE_MAX) {
++                g_pow_valid.erase(g_pow_order.front());
++                g_pow_order.pop_front();
++            }
++        }
++    }
++    return true;
++}
++
++/** Extract the pushed data of an OP_RETURN output. */
++bool OpReturnData(const CScript& spk, std::vector<unsigned char>& data_out)
++{
++    if (spk.empty() || spk[0] != OP_RETURN) return false;
++    if (spk.size() >= 2 && spk[1] <= 75) {
++        const size_t len{spk[1]};
++        if (spk.size() != 2 + len) return false;
++        data_out.assign(spk.begin() + 2, spk.end());
++        return true;
++    }
++    if (spk.size() >= 3 && spk[1] == OP_PUSHDATA1) {
++        const size_t len{spk[2]};
++        if (spk.size() != 3 + len) return false;
++        data_out.assign(spk.begin() + 3, spk.end());
++        return true;
++    }
++    if (spk.size() >= 4 && spk[1] == OP_PUSHDATA2) {
++        const size_t len{size_t{spk[2]} | (size_t{spk[3]} << 8)};
++        if (spk.size() != 4 + len) return false;
++        data_out.assign(spk.begin() + 4, spk.end());
++        return true;
++    }
++    return false;
++}
++
++std::optional<PerTicket> ParseTicketFromScript(const CScript& spk)
++{
++    std::vector<unsigned char> d;
++    if (!OpReturnData(spk, d)) return std::nullopt;
++    if (d.size() < PER_TICKET_OVERHEAD) return std::nullopt;
++    if (d[0] != 'P' || d[1] != 'E' || d[2] != 'R' || d[3] != 'T') {
++        return std::nullopt;
++    }
++    PerTicket t;
++    std::memcpy(t.anchor.begin(), d.data() + 4, 32);
++    const size_t payout_len{d.size() - PER_TICKET_OVERHEAD};
++    t.payout = CScript(d.begin() + 4 + 32, d.begin() + 4 + 32 + payout_len);
++    t.nonce = ReadLE32(d.data() + d.size() - 4);
++    return t;
++}
++
++std::mutex g_pool_mutex;
++std::map<uint256, PerTicket> g_pool;
++// Bumped on every pool mutation; read lock-free by getblocktemplate.
++std::atomic<uint64_t> g_pool_version{0};
++std::mutex g_state_mutex;
++std::map<uint256, PerState> g_state_cache;
++// FIFO order for the bounded caches below (front = oldest).
++std::deque<uint256> g_state_order;
++constexpr size_t PER_STATE_CACHE_MAX{4096};
++
++// HIGH-03: ticket ids already embedded per block, bounded. Keyed by block hash
++// (immutable per block) so hits are exact and misses just re-read disk; the
++// FIFO cap keeps IBD memory flat no matter how long the chain gets.
++constexpr size_t PER_EMBEDDED_CACHE_MAX{144};
++std::mutex g_embedded_mutex;
++std::map<uint256, std::vector<uint256>> g_embedded_cache;
++std::deque<uint256> g_embedded_order;
++
++/** Ticket ids embedded by pindex's block (cached, bounded). nullopt means
++ *  the block could not be read (callers treat that as retryable, not empty). */
++std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
++                                                    const node::BlockManager& blockman)
++{
++    if (!pindex) return std::nullopt;
++    const uint256 hash{pindex->GetBlockHash()};
++    {
++        std::lock_guard<std::mutex> lock{g_embedded_mutex};
++        if (auto it{g_embedded_cache.find(hash)}; it != g_embedded_cache.end()) {
++            return std::set<uint256>(it->second.begin(), it->second.end());
++        }
++    }
++    std::set<uint256> ids;
++    if (auto t{PerBlockTickets(pindex, blockman)}) {
++        for (const auto& x : *t) ids.insert(x.Id());
++    }
++    {
++        std::lock_guard<std::mutex> lock{g_embedded_mutex};
++        g_embedded_cache[hash] = std::vector<uint256>(ids.begin(), ids.end());
++        g_embedded_order.push_back(hash);
++        while (g_embedded_order.size() > PER_EMBEDDED_CACHE_MAX) {
++            g_embedded_cache.erase(g_embedded_order.front());
++            g_embedded_order.pop_front();
++        }
++    }
++    return ids;
++}
++
++} // namespace
++
++bool PerTicketPowValid(const PerTicket& ticket, uint32_t anchor_nbits,
++                       const Consensus::Params& params)
++{
++    return PerTicketPowPass(ticket, anchor_nbits, params);
++}
++
++uint256 PerTicket::Id() const
++{
++    // v31.1 port: CHashWriter was removed upstream. Its CHashWriter::operator<< did
++    // exactly `::Serialize(*this, obj)` on the HashWriter base and never emitted the
++    // nVersion it stored, so HashWriter (the surviving base class, same double-SHA256
++    // GetHash()) produces a byte-for-byte identical digest and therefore identical
++    // ticket ids. Keep this stable: PerTicket ids are consensus-relevant.
++    HashWriter ss;
++    ss << *this;
++    return ss.GetHash();
++}
++
++CAmount PerFeeShare(CAmount fee)
++{
++    return fee / 2;
++}
++
++int PerEpoch(int height, const Consensus::Params& params)
++{
++    if (height <= 0) return 0;
++    if (params.nPerEpochBlocks <= 0) return 0;
++    return (height - 1) / params.nPerEpochBlocks;
++}
++
++PerState PerNextState(const PerState& prev, int height, CAmount fees,
++                      uint32_t nTickets, const Consensus::Params& params)
++{
++    PerState cur{prev};
++    const int epoch_blocks{params.nPerEpochBlocks};
++    if (epoch_blocks > 0 && height > 1 && ((height - 1) % epoch_blocks) == 0) {
++        // First block of a new epoch closes the previous one.
++        const CAmount rate{cur.tickets ? cur.pool / (CAmount)cur.tickets : 0};
++        cur.pool = cur.pool - rate * (CAmount)cur.tickets;
++        cur.tickets = 0;
++        cur.rate = rate;
++    }
++    cur.pool += PerFeeShare(fees);
++    cur.tickets += nTickets;
++    return cur;
++}
++
++CTxOut PerCommitmentOutput(const PerCommitment& per)
++{
++    std::vector<unsigned char> data;
++    data.reserve(PER_COMMIT_DATA_SIZE);
++    data.push_back('P');
++    data.push_back('E');
++    data.push_back('R');
++    data.push_back(0x01);
++    AppendLE64(data, per.state.pool);
++    AppendLE32(data, per.state.tickets);
++    AppendLE64(data, per.state.rate);
++    AppendLE16(data, per.block_tickets);
++    AppendLE16(data, per.payouts);
++    CScript spk;
++    spk << OP_RETURN << data;
++    return CTxOut{0, spk};
++}
++
++std::optional<PerCommitment> ParsePerCommitment(const CTransaction& tx,
++                                               size_t* index_out)
++{
++    for (size_t i = 0; i < tx.vout.size(); ++i) {
++        const CScript& spk{tx.vout[i].scriptPubKey};
++        // Exact encoding our miner produces: OP_RETURN + push 28.
++        if (spk.size() != 2 + PER_COMMIT_DATA_SIZE) continue;
++        if (spk[0] != OP_RETURN) continue;
++        if (spk[1] != PER_COMMIT_DATA_SIZE) continue;
++        if (spk[2] != 'P' || spk[3] != 'E' || spk[4] != 'R' || spk[5] != 0x01) {
++            continue;
++        }
++        const unsigned char* d{&spk[2]};
++        PerCommitment c;
++        c.state.pool = static_cast<CAmount>(ReadLE64(d + 4));
++        c.state.tickets = ReadLE32(d + 12);
++        c.state.rate = static_cast<CAmount>(ReadLE64(d + 16));
++        c.block_tickets = ReadLE16(d + 24);
++        c.payouts = ReadLE16(d + 26);
++        if (index_out) *index_out = i;
++        return c;
++    }
++    return std::nullopt;
++}
++
++CTxOut PerTicketOutput(const PerTicket& ticket)
++{
++    std::vector<unsigned char> data;
++    data.reserve(PER_TICKET_OVERHEAD + ticket.payout.size());
++    data.push_back('P');
++    data.push_back('E');
++    data.push_back('R');
++    data.push_back('T');
++    data.insert(data.end(), ticket.anchor.begin(), ticket.anchor.end());
++    data.insert(data.end(), ticket.payout.begin(), ticket.payout.end());
++    AppendLE32(data, ticket.nonce);
++    CScript spk;
++    spk << OP_RETURN << data;
++    return CTxOut{0, spk};
++}
++
++std::optional<std::vector<PerTicket>> PerBlockTickets(
++    const CBlockIndex* pindex, const node::BlockManager& blockman)
++{
++    if (!pindex) return std::nullopt;
++    CBlock block;
++    if (!blockman.ReadBlock(block, *pindex)) return std::nullopt;
++    if (block.vtx.empty()) return std::nullopt;
++    const CTransaction& cb{*block.vtx[0]};
++    // CRIT-01: only the committed range counts. PERT outputs smuggled outside
++    // [2, 2+block_tickets) were never PoW-checked at connect time and must not
++    // become payout rights one epoch later. No commitment (genesis) = no tickets.
++    size_t commit_idx{0};
++    auto per{ParsePerCommitment(cb, &commit_idx)};
++    if (!per || commit_idx != 1) return std::vector<PerTicket>{};
++    std::vector<PerTicket> out;
++    const size_t end{std::min<size_t>(2 + per->block_tickets, cb.vout.size())};
++    for (size_t i = 2; i < end; ++i) {
++        if (auto t{ParseTicketFromScript(cb.vout[i].scriptPubKey)}) out.push_back(*t);
++    }
++    return out;
++}
++
++bool PerPayoutScriptAllowed(const CScript& payout)
++{
++    if (payout.empty()) return false;
++    if (payout.IsUnspendable()) return false;
++    if (payout.size() > 100) return false;
++    return true;
++}
++
++std::optional<PerTicket> PerMineTicket(const uint256& anchor,
++                                       uint32_t anchor_nbits,
++                                       const CScript& payout,
++                                       uint64_t max_tries,
++                                       const Consensus::Params& params,
++                                       const util::SignalInterrupt* interrupt)
++{
++    if (!PerPayoutScriptAllowed(payout)) return std::nullopt;
++    const arith_uint256 target{
++        TicketTarget(anchor_nbits, params.nPerTicketTargetMultiplier)};
++    if (target == 0) return std::nullopt;
++    for (uint64_t n = 0; n < max_tries && n <= 0xffffffffu; ++n) {
++        // Respond to shutdown promptly (a default 1M-try run is hours of hashing).
++        // v31.1 port: the global ShutdownRequested() is gone; the caller supplies the
++        // interrupt flag (ChainstateManager::m_interrupt).
++        if ((n & 1023) == 0 && interrupt && static_cast<bool>(*interrupt)) return std::nullopt;
++        PerTicket t{anchor, payout, static_cast<uint32_t>(n)};
++        if (UintToArith256(TicketPowHash(t)) <= target) return t;
++    }
++    return std::nullopt;
++}
++
++bool PerCheckTicketForChain(const PerTicket& ticket, const CBlockIndex* tip,
++                            const node::BlockManager& blockman,
++                            const Consensus::Params& params, std::string& err)
++{
++    if (!PerPayoutScriptAllowed(ticket.payout)) {
++        err = "bad payout script";
++        return false;
++    }
++    if (!tip) {
++        err = "no tip";
++        return false;
++    }
++    const CBlockIndex* anchorIdx{blockman.LookupBlockIndex(ticket.anchor)};
++    if (!anchorIdx) {
++        err = "unknown anchor";
++        return false;
++    }
++    if (anchorIdx->nHeight > tip->nHeight) {
++        err = "anchor in future";
++        return false;
++    }
++    if (tip->GetAncestor(anchorIdx->nHeight) != anchorIdx) {
++        err = "anchor not on active chain";
++        return false;
++    }
++    const int diff{tip->nHeight - anchorIdx->nHeight};
++    // MED-05: relay only tickets that can still be mined. A ticket relayed at
++    // diff==window would land at dh==window+1 in the next block and be rejected
++    // there, so it would rot in the pool wasting RandomX verifies.
++    if (diff < 0 || diff >= params.nPerTicketWindow) {
++        err = "anchor outside window";
++        return false;
++    }
++    // CRIT-32: cached PoW verdict (same accept/reject as the code it replaces).
++    if (!PerTicketPowPass(ticket, anchorIdx->nBits, params)) {
++        err = "insufficient ticket work";
++        return false;
++    }
++    return true;
++}
++
++bool PerPoolHas(const uint256& ticket_id)
++{
++    std::lock_guard<std::mutex> lock{g_pool_mutex};
++    return g_pool.count(ticket_id) != 0;
++}
++
++bool PerPoolAdd(const PerTicket& ticket)
++{
++    std::lock_guard<std::mutex> lock{g_pool_mutex};
++    if (g_pool.size() >= PER_POOL_MAX) return false;
++    const uint256 id{ticket.Id()};
++    if (g_pool.count(id)) return false;
++    g_pool[id] = ticket;
++    ++g_pool_version;
++    return true;
++}
++
++uint64_t PerPoolVersion()
++{
++    return g_pool_version.load();
++}
++
++size_t PerPoolSize()
++{
++    std::lock_guard<std::mutex> lock{g_pool_mutex};
++    return g_pool.size();
++}
++
++void PerPoolSweep(const CBlockIndex* tip, const node::BlockManager& blockman,
++                  const Consensus::Params& params)
++{
++    if (!tip) return;
++    std::map<uint256, PerTicket> copy;
++    {
++        std::lock_guard<std::mutex> lock{g_pool_mutex};
++        copy = g_pool;
++    }
++    // Classify without holding g_pool_mutex (chain lookups below need no pool
++    // lock; the caller holds cs_main for the block index). Anchors unknown to
++    // us can never have entered legitimately (relay and mining both require a
++    // known anchor), so they are swept too.
++    const int nextHeight{tip->nHeight + 1};
++    std::vector<uint256> stale;
++    for (const auto& [id, t] : copy) {
++        const CBlockIndex* a{blockman.LookupBlockIndex(t.anchor)};
++        if (!a || a->nHeight >= nextHeight) { stale.push_back(id); continue; }
++        const int diff{nextHeight - a->nHeight};
++        if (diff < 1 || diff > params.nPerTicketWindow) { stale.push_back(id); continue; }
++        if (tip->GetAncestor(a->nHeight) != a) { stale.push_back(id); continue; }
++        if (!PerPayoutScriptAllowed(t.payout)) { stale.push_back(id); continue; }
++    }
++    if (stale.empty()) return;
++    {
++        std::lock_guard<std::mutex> lock{g_pool_mutex};
++        for (const auto& id : stale) g_pool.erase(id);
++        ++g_pool_version;
++    }
++}
++
++std::vector<PerTicket> PerPoolCollect(const CBlockIndex* tip,
++                                      const node::BlockManager& blockman,
++                                      const Consensus::Params& params)
++{
++    std::vector<PerTicket> out;
++    if (!tip) return out;
++    std::map<uint256, PerTicket> copy;
++    {
++        std::lock_guard<std::mutex> lock{g_pool_mutex};
++        copy = g_pool;
++    }
++    const int nextHeight{tip->nHeight + 1};
++    for (const auto& [id, t] : copy) {
++        const CBlockIndex* a{blockman.LookupBlockIndex(t.anchor)};
++        if (!a) continue;
++        if (a->nHeight >= nextHeight) continue;
++        const int diff{nextHeight - a->nHeight};
++        if (diff < 1 || diff > params.nPerTicketWindow) continue;
++        if (tip->GetAncestor(a->nHeight) != a) continue;
++        if (!PerPayoutScriptAllowed(t.payout)) continue;
++        // CRIT-31: skip tickets already embedded in recent history. Without this,
++        // a replayed ticket poisons every template (TestBlockValidity throws) and
++        // wedges this miner until the anchor ages out. Cached: no disk on hits.
++        {
++            bool embedded{false};
++            const CBlockIndex* b{tip};
++            for (int i = 0; i < params.nPerTicketWindow && b; ++i) {
++                auto hist{EmbeddedTicketIds(b, blockman)};
++                if (!hist) break;
++                if (hist->count(id)) { embedded = true; break; }
++                b = b->pprev;
++            }
++            if (embedded) continue;
++        }
++        out.push_back(t);
++        if (out.size() >= params.nPerMaxBlockTickets) break;
++    }
++    if (out.size() > params.nPerMaxBlockTickets) {
++        out.resize(params.nPerMaxBlockTickets);
++    }
++    // Opportunistic garbage collection: drops tickets this call classified as
++    // unembeddable, so the pool cannot wedge on its own stale entries.
++    PerPoolSweep(tip, blockman, params);
++    return out;
++}
++
++std::optional<PerState> GetPerState(const CBlockIndex* pindex,
++                                    const node::BlockManager& blockman)
++{
++    if (!pindex || pindex->nHeight == 0) return PerState{0, 0, 0};
++    const uint256 hash{pindex->GetBlockHash()};
++    {
++        std::lock_guard<std::mutex> lock{g_state_mutex};
++        if (auto it{g_state_cache.find(hash)}; it != g_state_cache.end()) {
++            return it->second;
++        }
++    }
++    CBlock block;
++    if (!blockman.ReadBlock(block, *pindex)) return std::nullopt;
++    if (block.vtx.empty()) return std::nullopt;
++    auto per{ParsePerCommitment(*block.vtx[0], nullptr)};
++    if (!per) return std::nullopt;
++    {
++        std::lock_guard<std::mutex> lock{g_state_mutex};
++        g_state_cache[hash] = per->state;
++        // Bound the cache (FIFO): misses just re-read disk, so eviction is safe.
++        g_state_order.push_back(hash);
++        while (g_state_order.size() > PER_STATE_CACHE_MAX) {
++            g_state_cache.erase(g_state_order.front());
++            g_state_order.pop_front();
++        }
++    }
++    return per->state;
++}
++
++void CachePerState(const CBlockIndex* pindex, const PerState& state)
++{
++    if (!pindex) return;
++    std::lock_guard<std::mutex> lock{g_state_mutex};
++    const uint256 hash{pindex->GetBlockHash()};
++    g_state_cache[hash] = state;
++    g_state_order.push_back(hash);
++    while (g_state_order.size() > PER_STATE_CACHE_MAX) {
++        g_state_cache.erase(g_state_order.front());
++        g_state_order.pop_front();
++    }
++}
++
++bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
++                               const CBlockIndex* pindex,
++                               const node::BlockManager& blockman,
++                               const Consensus::Params& params,
++                               BlockValidationState& state,
++                               CAmount& payouts_out,
++                               bool drop_pool)
++{
++    payouts_out = 0;
++    if (block.vtx.empty()) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "empty block");
++    }
++    if (!pindex) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "no block index");
++    }
++    const CTransaction& cb{*block.vtx[0]};
++    if (per.block_tickets > params.nPerMaxBlockTickets) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per-tickets", "too many tickets");
++    }
++    size_t commit_idx{0};
++    if (!ParsePerCommitment(cb, &commit_idx) || commit_idx != 1) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "commitment must be vout 1");
++    }
++    if (cb.vout[1].nValue != 0) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "commitment value must be 0");
++    }
++    if (cb.vout.size() <
++        (size_t)2 + per.block_tickets + per.payouts) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "coinbase too small");
++    }
++    // CRIT-01: PERT outputs outside the committed ticket slice never passed a
++    // PoW check; reject them so smuggled records can never mature into payouts.
++    // (Payout outputs cannot false-positive: they must equal validated,
++    // non-OP_RETURN payout scripts, checked below.)
++    for (size_t i = 0; i < cb.vout.size(); ++i) {
++        if (i >= 2 && i < (size_t)2 + per.block_tickets) continue;
++        if (ParseTicketFromScript(cb.vout[i].scriptPubKey)) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket", "extra PERT outside range");
++        }
++    }
++    const CBlockIndex* parent{pindex->pprev};
++    // A ticket may be embedded only once per window: preload the ids already
++    // embedded by the previous nPerTicketWindow blocks (at most 10 block reads
++    // per connected block) so a replayed ticket pays nothing.
++    std::set<uint256> seen;
++    {
++        const CBlockIndex* a{parent};
++        for (int i = 0; i < params.nPerTicketWindow && a; ++i) {
++            auto hist{EmbeddedTicketIds(a, blockman)};
++            // Unreadable history must not silently disable replay detection
++            // (a replay could then over-mint): retryable, like the paths above.
++            if (!hist) return state.Error("cannot read ticket history");
++            seen.insert(hist->begin(), hist->end());
++            a = a->pprev;
++        }
++    }
++    std::vector<PerTicket> tickets;
++    tickets.reserve(per.block_tickets);
++    std::vector<uint256> ids;
++    ids.reserve(per.block_tickets);
++    for (uint16_t i = 0; i < per.block_tickets; ++i) {
++        const CTxOut& o{cb.vout[2 + i]};
++        if (o.nValue != 0) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket", "ticket value must be 0");
++        }
++        auto t{ParseTicketFromScript(o.scriptPubKey)};
++        if (!t) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket", "malformed ticket");
++        }
++        const uint256 id{t->Id()};
++        if (!seen.insert(id).second) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket", "duplicate ticket");
++        }
++        std::string err;
++        if (!PerCheckTicketForChain(*t, parent, blockman, params, err)) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket",
++                                 "invalid ticket: " + err);
++        }
++        const CBlockIndex* a{blockman.LookupBlockIndex(t->anchor)};
++        if (!a) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket", "unknown anchor");
++        }
++        const int dh{pindex->nHeight - a->nHeight};
++        if (dh < 1 || dh > params.nPerTicketWindow) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket",
++                                 "anchor outside window for this block");
++        }
++        tickets.push_back(*t);
++        ids.push_back(id);
++    }
++    for (size_t i = 1; i < ids.size(); ++i) {
++        if (!(ids[i - 1] < ids[i])) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-ticket",
++                                 "tickets not sorted by id");
++        }
++    }
++    auto prev_per{GetPerState(parent, blockman)};
++    if (!prev_per) {
++        // Disk-read failure (pruning is refused, so only corruption/transient
++        // I/O): retryable, not a consensus verdict. Never mark the block.
++        return state.Error("missing prev PER state");
++    }
++    const CAmount rate{
++        PerNextState(*prev_per, pindex->nHeight, 0, 0, params).rate};
++    if (rate < 0 || !MoneyRange(rate)) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per", "negative rate");
++    }
++    // MED-06: reject before the multiply below can wrap (signed overflow is
++    // UB); per.payouts is uint16_t so the division is always safe here.
++    if (per.payouts > 0 && rate > MAX_MONEY / per.payouts) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per-payout", "payout overflow");
++    }
++    const int src_h{pindex->nHeight - params.nPerEpochBlocks};
++    std::vector<PerTicket> src_tickets;
++    if (src_h >= 1 && rate > 0) {
++        const CBlockIndex* src{pindex->GetAncestor(src_h)};
++        if (!src) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-payout", "missing payout source");
++        }
++        auto sopt{PerBlockTickets(src, blockman)};
++        if (!sopt) {
++            // Same as above: unreadable disk is not a guilty block.
++            return state.Error("cannot read payout source");
++        }
++        src_tickets = *sopt;
++    }
++    const size_t expected{(src_h >= 1 && rate > 0) ? src_tickets.size() : 0};
++    if (per.payouts != expected) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per-payout", "wrong payout count");
++    }
++    for (size_t i = 0; i < src_tickets.size(); ++i) {
++        const CTxOut& o{cb.vout[2 + per.block_tickets + i]};
++        if (o.nValue != rate) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-payout", "wrong payout amount");
++        }
++        if (!(o.scriptPubKey == src_tickets[i].payout)) {
++            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                 "bad-cb-per-payout", "wrong payout script");
++        }
++    }
++    payouts_out = rate * (CAmount)per.payouts;
++    // MED-06: belt and suspenders after the pre-multiply overflow guard above.
++    if (!MoneyRange(payouts_out)) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per-payout", "payouts out of range");
++    }
++    if (payouts_out < 0) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                             "bad-cb-per-payout", "negative payouts");
++    }
++    // Confirmed tickets leave the local pool (like confirmed mempool txs), so
++    // honest miners never re-embed them while the anchor is still in window.
++    // Skipped for fJustCheck: TestBlockValidity runs on every template built by
++    // CreateNewBlock, and draining there would empty the pool before mining.
++    if (drop_pool) {
++        std::lock_guard<std::mutex> lock{g_pool_mutex};
++        for (const auto& id : ids) g_pool.erase(id);
++        if (!ids.empty()) ++g_pool_version;
++    }
++    return true;
++}
+diff --git a/src/per.h b/src/per.h
+new file mode 100644
+index 0000000..7a85682
+--- /dev/null
++++ b/src/per.h
+@@ -0,0 +1,163 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_PER_H
++#define BITCOIN_PER_H
++
++#include <consensus/amount.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <serialize.h>
++#include <uint256.h>
++#include <util/signalinterrupt.h>
++
++#include <atomic>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++class CBlock;
++class CBlockIndex;
++class BlockValidationState;
++namespace node { class BlockManager; }
++namespace Consensus { struct Params; }
++
++/**
++ * CacheCoin PER (Protracted Entropy Reservoir).
++ *
++ * Fees are split, not burned: the miner of a block claims the subsidy plus
++ * fees - fees/2; the other half enters the current epoch reservoir.
++ * An entropy ticket is a RandomX proof of work over (anchor, payout, nonce)
++ * at nPerTicketTargetMultiplier x the anchor block target. Up to
++ * nPerMaxBlockTickets tickets whose anchor is one of the last
++ * nPerTicketWindow blocks are embedded per block in the coinbase.
++ * At the first block of a new epoch the previous reservoir is divided
++ * equally among its tickets (rate); each ticket is paid one epoch later.
++ * The coinbase commits to all of it, so every node verifies the same math.
++ */
++
++/** Reservoir state after a block. */
++struct PerState {
++    CAmount pool{0};
++    uint32_t tickets{0};
++    CAmount rate{0};
++    bool operator==(const PerState& o) const
++    {
++        return pool == o.pool && tickets == o.tickets && rate == o.rate;
++    }
++    bool operator!=(const PerState& o) const { return !(*this == o); }
++};
++
++/** One entropy ticket: anchor block, payout script, nonce. */
++struct PerTicket {
++    uint256 anchor;
++    CScript payout;
++    uint32_t nonce{0};
++
++    uint256 Id() const;
++
++    SERIALIZE_METHODS(PerTicket, obj)
++    {
++        READWRITE(obj.anchor, obj.payout, obj.nonce);
++    }
++};
++
++/** What the coinbase commits to. */
++struct PerCommitment {
++    PerState state;
++    uint16_t block_tickets{0};
++    uint16_t payouts{0};
++};
++
++/** Half of the fees (integer floor) goes to the reservoir. */
++CAmount PerFeeShare(CAmount fee);
++
++/** Epoch number: heights 1..epoch_blocks are epoch 0. */
++int PerEpoch(int height, const Consensus::Params& params);
++
++/**
++ * Next reservoir state. At the first block of a new epoch the previous
++ * reservoir is divided: rate = pool / tickets (0 if no tickets), the
++ * remainder carries over and the ticket count resets. Then the fee share
++ * is added and the new block tickets counted. Rate is unchanged otherwise.
++ */
++PerState PerNextState(const PerState& prev, int height, CAmount fees,
++                      uint32_t nTickets, const Consensus::Params& params);
++
++/** Coinbase output committing to the reservoir state (value 0). */
++CTxOut PerCommitmentOutput(const PerCommitment& per);
++
++/** Find the commitment in a coinbase; index_out gets its vout index. */
++std::optional<PerCommitment> ParsePerCommitment(const CTransaction& tx,
++                                               size_t* index_out = nullptr);
++
++/** Coinbase output recording one ticket (value 0, contains "PERT"). */
++CTxOut PerTicketOutput(const PerTicket& ticket);
++
++/** Tickets embedded by the block at pindex (nullopt when unreadable). */
++std::optional<std::vector<PerTicket>> PerBlockTickets(
++    const CBlockIndex* pindex, const node::BlockManager& blockman);
++
++/** Payout scripts must be spendable and small (no OP_RETURN, no bloat). */
++bool PerPayoutScriptAllowed(const CScript& payout);
++
++/** Try nonces [0, max_tries); first hash meeting the ticket target wins.
++ *  If interrupt is non-null and set, the search stops early. */
++std::optional<PerTicket> PerMineTicket(const uint256& anchor,
++                                       uint32_t anchor_nbits,
++                                       const CScript& payout,
++                                       uint64_t max_tries,
++                                       const Consensus::Params& params,
++                                       const util::SignalInterrupt* interrupt = nullptr);
++
++/** Check a ticket against the active tip (window, PoW, payout). */
++bool PerCheckTicketForChain(const PerTicket& ticket, const CBlockIndex* tip,
++                            const node::BlockManager& blockman,
++                            const Consensus::Params& params, std::string& err);
++
++/** Proof-of-work check only (lock-free): ticket hash meets anchor target.
++ *  Used by the P2P handler so the ~20 ms RandomX hash never runs under cs_main
++ *  (which would stall block connect, mempool, RPC and scheduler). */
++bool PerTicketPowValid(const PerTicket& ticket, uint32_t anchor_nbits,
++                       const Consensus::Params& params);
++
++/** In-memory ticket pool (DoS: unverified relay input, capped). */
++bool PerPoolHas(const uint256& ticket_id);
++bool PerPoolAdd(const PerTicket& ticket);
++size_t PerPoolSize();
++/** Monotonic counter bumped on every pool mutation (add, sweep-erase, connect
++ *  drain). getblocktemplate rebuilds when it changes, so relayed tickets show
++ *  up without waiting for the mempool-based cache timeout. Lock-free. */
++uint64_t PerPoolVersion();
++/** Erase entries that can never be embedded again (stale anchor, bad chain,
++ *  bad payout). Caller must hold cs_main. Without this the pool fills with
++ *  its own stale tickets (~a week of the documented ticket loop) and stops
++ *  accepting anything. */
++void PerPoolSweep(const CBlockIndex* tip, const node::BlockManager& blockman,
++                  const Consensus::Params& params);
++std::vector<PerTicket> PerPoolCollect(const CBlockIndex* tip,
++                                      const node::BlockManager& blockman,
++                                      const Consensus::Params& params);
++
++/** Reservoir state committed by pindex (nullopt when unavailable). */
++std::optional<PerState> GetPerState(const CBlockIndex* pindex,
++                                    const node::BlockManager& blockman);
++void CachePerState(const CBlockIndex* pindex, const PerState& state);
++
++/**
++ * Validate the ticket records and payout outputs of a block.
++ * Sets payouts_out to the total reservoir payout (added to blockReward).
++ * When drop_pool is true (real connect, NOT fJustCheck/TestBlockValidity),
++ * embedded tickets leave the local pool; template creation must never drain.
++ */
++bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
++                               const CBlockIndex* pindex,
++                               const node::BlockManager& blockman,
++                               const Consensus::Params& params,
++                               BlockValidationState& state,
++                               CAmount& payouts_out,
++                               bool drop_pool = true);
++
++#endif // BITCOIN_PER_H
+diff --git a/src/protocol.h b/src/protocol.h
+index 8ed90dd..0d9035a 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -264,6 +264,11 @@ inline constexpr const char* WTXIDRELAY{"wtxidrelay"};
+  * txreconciliation, as described by BIP 330.
+  */
+ inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
++/**
++ * CacheCoin PER: carries one entropy ticket (anchor, payout script, nonce). Relayed like a
++ * transaction so a ticket a small miner found reaches whoever mines the next block.
++ */
++inline constexpr const char* PERTICKET{"perticket"};
+ }; // namespace NetMsgType
+ 
+ /** All known message types (see above). Keep this in the same order as the list of messages above. */
+@@ -303,6 +308,7 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
+     NetMsgType::CFCHECKPT,
+     NetMsgType::WTXIDRELAY,
+     NetMsgType::SENDTXRCNCL,
++    NetMsgType::PERTICKET,
+ })};
+ 
+ /** nServices flags */
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 36dbc5c..a9df0c8 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -20,9 +20,11 @@
+ #include <interfaces/mining.h>
+ #include <key_io.h>
+ #include <net.h>
++#include <net_processing.h>
+ #include <node/context.h>
+ #include <node/miner.h>
+ #include <node/warnings.h>
++#include <per.h>
+ #include <policy/ephemeral_policy.h>
+ #include <pow.h>
+ #include <random.h>
+@@ -44,8 +46,10 @@
+ #include <validation.h>
+ #include <validationinterface.h>
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <memory>
++#include <numeric>
+ 
+ using interfaces::BlockRef;
+ using interfaces::BlockTemplate;
+@@ -863,14 +867,20 @@ static RPCHelpMan getblocktemplate()
+     static CBlockIndex* pindexPrev;
+     static int64_t time_start;
+     static std::unique_ptr<BlockTemplate> block_template;
++    // CacheCoin PER: the ticket pool is not the mempool, so pool changes never
++    // trip the cache below. Rebuild when the pool mutates, or relayed tickets
++    // stay invisible to getblocktemplate miners until the next block/mempool tick.
++    static uint64_t nPerPoolVersionLast{0};
+     if (!pindexPrev || pindexPrev->GetBlockHash() != tip ||
+-        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5))
++        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5) ||
++        PerPoolVersion() != nPerPoolVersionLast)
+     {
+         // Clear pindexPrev so future calls make a new block, despite any failures from here on
+         pindexPrev = nullptr;
+ 
+         // Store the pindexBest used before createNewBlock, to avoid races
+         nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
++        nPerPoolVersionLast = PerPoolVersion();
+         CBlockIndex* pindexPrevNew = chainman.m_blockman.LookupBlockIndex(tip);
+         time_start = GetTime();
+ 
+@@ -996,6 +1006,31 @@ static RPCHelpMan getblocktemplate()
+     result.pushKV("transactions", std::move(transactions));
+     result.pushKV("coinbaseaux", std::move(aux));
+     result.pushKV("coinbasevalue", block.vtx[0]->vout[0].nValue);
++    // CacheCoin PER: vTxFees is per-transaction in v31.1 (the coinbase is not in it), so the
++    // block's total fees are their sum. getTxFees() returns BY VALUE, so it must be
++    // bound to one local: calling it twice would take begin() and end() from two
++    // different temporaries (and with a non-empty mempool that segfaults). The
++    // per-transaction vector is the only source.
++    const std::vector<CAmount> per_tx_fees{block_template->getTxFees()};
++    const CAmount total_fees{std::accumulate(per_tx_fees.begin(), per_tx_fees.end(), CAmount{0})};
++    result.pushKV("coinbasefee", (int64_t)(total_fees - PerFeeShare(total_fees)));
++    result.pushKV("reservoirfee", (int64_t)PerFeeShare(total_fees));
++    // Every coinbase must carry the template's PER outputs unchanged (see per.h).
++    UniValue per_outputs(UniValue::VARR);
++    size_t per_index{0};
++    if (const auto per{ParsePerCommitment(*block.vtx[0], &per_index)}) {
++        // Clamp to the coinbase's real output count: the range is commitment + the ticket
++        // records + the payouts, and the witness commitment follows them.
++        const size_t per_end{std::min(block.vtx[0]->vout.size(),
++                                      per_index + per->block_tickets + per->payouts + 1)};
++        for (size_t i = per_index; i < per_end; ++i) {
++            UniValue out(UniValue::VOBJ);
++            out.pushKV("value", (int64_t)block.vtx[0]->vout[i].nValue);
++            out.pushKV("script", HexStr(block.vtx[0]->vout[i].scriptPubKey));
++            per_outputs.push_back(out);
++        }
++    }
++    result.pushKV("peroutputs", per_outputs);
+     result.pushKV("longpollid", tip.GetHex() + ToString(nTransactionsUpdatedLast));
+     result.pushKV("target", hashTarget.GetHex());
+     result.pushKV("mintime", GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()));
+@@ -1022,9 +1057,11 @@ static RPCHelpMan getblocktemplate()
+         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
+     }
+ 
+-    if (auto coinbase{block_template->getCoinbaseTx()}; coinbase.required_outputs.size() > 0) {
+-        CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
+-        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs[0].scriptPubKey));
++    if (auto coinbase{block_template->getCoinbaseTx()}; !coinbase.required_outputs.empty()) {
++        // CacheCoin PER: the node's own required outputs (the PER commitment, this block's
++        // ticket records and reservoir payouts) are pushed ahead of the witness commitment,
++        // so the commitment is the last entry rather than the only one.
++        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs.back().scriptPubKey));
+     }
+ 
+     return result;
+@@ -1142,9 +1179,133 @@ static RPCHelpMan submitheader()
+     };
+ }
+ 
++static RPCHelpMan getperinfo()
++{
++    return RPCHelpMan{"getperinfo",
++        "\nReturns the PER epoch reservoir state after a block (default: the active tip).\n",
++        {
++            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"the active tip"}, "Block whose state to show"},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::STR_HEX, "blockhash", "the block"},
++                {RPCResult::Type::NUM, "height", "its height"},
++                {RPCResult::Type::NUM, "epoch", "epoch number (heights 1..epoch_blocks are epoch 0)"},
++                {RPCResult::Type::NUM, "epoch_blocks", "blocks per epoch"},
++                {RPCResult::Type::NUM, "epoch_end_height", "last block of this epoch"},
++                {RPCResult::Type::NUM, "blocks_remaining", "blocks left in this epoch after this block"},
++                {RPCResult::Type::NUM, "pool", "reservoir of this epoch so far, in satoshis"},
++                {RPCResult::Type::NUM, "tickets", "tickets included in this epoch so far"},
++                {RPCResult::Type::NUM, "rate", "satoshis paid per ticket of the previous epoch during this epoch"},
++            }},
++        RPCExamples{HelpExampleCli("getperinfo", "") + HelpExampleRpc("getperinfo", "")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    ChainstateManager& chainman = EnsureAnyChainman(request.context);
++    LOCK(cs_main);
++    const CBlockIndex* pindex{chainman.ActiveChain().Tip()};
++    if (!request.params[0].isNull()) {
++        pindex = chainman.m_blockman.LookupBlockIndex(ParseHashV(request.params[0], "blockhash"));
++        if (!pindex) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
++    }
++    const auto per{GetPerState(pindex, chainman.m_blockman)};
++    if (!per) throw JSONRPCError(RPC_MISC_ERROR, "PER state of this block is not available (block data missing)");
++    const Consensus::Params& consensus{chainman.GetConsensus()};
++    const int epoch{PerEpoch(pindex->nHeight, consensus)};
++    const int end{(epoch + 1) * consensus.nPerEpochBlocks};
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("blockhash", pindex->GetBlockHash().GetHex());
++    result.pushKV("height", pindex->nHeight);
++    result.pushKV("epoch", epoch);
++    result.pushKV("epoch_blocks", consensus.nPerEpochBlocks);
++    result.pushKV("epoch_end_height", end);
++    result.pushKV("blocks_remaining", end - std::max(pindex->nHeight, 0));
++    result.pushKV("pool", per->pool);
++    result.pushKV("tickets", (uint64_t)per->tickets);
++    result.pushKV("rate", per->rate);
++    return result;
++},
++    };
++}
++
++static RPCHelpMan generateperticket()
++{
++    return RPCHelpMan{"generateperticket",
++        "\nMine one PER entropy ticket for the given payout address, anchored to the current tip,\n"
++        "and add it to this node's pool so the next block can embed it. For CPU miners who want a\n"
++        "share of the epoch reservoir without having to find a full block.\n",
++        {
++            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The CacheCoin address the ticket pays to"},
++            {"maxtries", RPCArg::Type::NUM, RPCArg::Default{1000000}, "How many nonces to try"},
++        },
++        RPCResult{RPCResult::Type::OBJ, "", "", {
++            {RPCResult::Type::BOOL, "found", "whether a ticket was found within maxtries"},
++            {RPCResult::Type::STR_HEX, "ticketid", /*optional=*/true, "the ticket's id, if found"},
++            {RPCResult::Type::STR_HEX, "anchor", /*optional=*/true, "the block it is anchored to, if found"},
++            {RPCResult::Type::BOOL, "pooled", /*optional=*/true, "whether the ticket entered this node's pool (false when the pool is full of fresh tickets)"},
++            {RPCResult::Type::NUM, "pool", "tickets now in this node's pool"},
++        }},
++        RPCExamples{HelpExampleCli("generateperticket", "\"cccn1q...\"")},
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    const CTxDestination dest = DecodeDestination(request.params[0].get_str());
++    if (!IsValidDestination(dest)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
++    const CScript payout = GetScriptForDestination(dest);
++    if (!PerPayoutScriptAllowed(payout)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Address type not allowed for PER tickets");
++    uint64_t tries = request.params[1].isNull() ? 1000000 : request.params[1].getInt<uint64_t>();
++
++    ChainstateManager& chainman = EnsureAnyChainman(request.context);
++    uint256 anchor;
++    uint32_t anchor_nbits;
++    const Consensus::Params& consensus = chainman.GetConsensus();
++    {
++        LOCK(cs_main);
++        const CBlockIndex* tip = chainman.ActiveChain().Tip();
++        // No tip yet (start-up before genesis load): refuse instead of dereferencing null.
++        if (!tip) throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Node has no tip yet");
++        anchor = tip->GetBlockHash();
++        anchor_nbits = tip->nBits;
++    }
++    // v31.1 port: chainman.m_interrupt replaces the removed global ShutdownRequested().
++    const auto ticket = PerMineTicket(anchor, anchor_nbits, payout, tries, consensus, &chainman.m_interrupt);
++
++    UniValue result(UniValue::VOBJ);
++    result.pushKV("found", (bool)ticket);
++    if (ticket) {
++        std::string err;
++        {
++            LOCK(cs_main);
++            if (!PerCheckTicketForChain(*ticket, chainman.ActiveChain().Tip(), chainman.m_blockman, consensus, err)) {
++                throw JSONRPCError(RPC_VERIFY_ERROR, "mined ticket did not validate: " + err);
++            }
++        }
++        result.pushKV("ticketid", ticket->Id().GetHex());
++        result.pushKV("anchor", ticket->anchor.GetHex());
++        // A full pool of fresh tickets means this one was mined for nothing;
++        // say so instead of silently dropping it (sweep once for a retry first).
++        bool pooled{false};
++        {
++            LOCK(cs_main);
++            PerPoolSweep(chainman.ActiveChain().Tip(), chainman.m_blockman, consensus);
++            pooled = PerPoolAdd(*ticket);
++        }
++        if (pooled) {
++            EnsurePeerman(EnsureAnyNodeContext(request.context)).RelayPerTicket(*ticket);
++        }
++        result.pushKV("pooled", pooled);
++    }
++    result.pushKV("pool", (uint64_t)PerPoolSize());
++    return result;
++},
++    };
++}
++
+ void RegisterMiningRPCCommands(CRPCTable& t)
+ {
+     static const CRPCCommand commands[]{
++        {"mining", &getperinfo},
++        {"hidden", &generateperticket},
+         {"mining", &getnetworkhashps},
+         {"mining", &getmininginfo},
+         {"mining", &prioritisetransaction},
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 4e539d7..a8dc0ab 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -36,6 +36,7 @@
+ #include <policy/rbf.h>
+ #include <policy/settings.h>
+ #include <policy/truc_policy.h>
++#include <per.h>
+ #include <pow.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
+@@ -2626,7 +2627,27 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+              Ticks<SecondsDouble>(m_chainman.time_connect),
+              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
+ 
+-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
++    // CacheCoin PER: the miner may claim the subsidy and fees - fees/2; the other half of the
++    // fees goes into the epoch reservoir, whose state the coinbase commits to (see per.h).
++    const auto per{ParsePerCommitment(*block.vtx[0])};
++    if (!per) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-per", "missing or malformed PER commitment");
++    }
++    const auto prev_per{GetPerState(pindex->pprev, m_blockman)};
++    if (!prev_per) {
++        return FatalError(m_chainman.GetNotifications(), state, Untranslated("Failed to read the PER state of the previous block"));
++    }
++    CAmount per_payouts{0};
++    // TestBlockValidity (fJustCheck, run for every template) must not drain
++    // the ticket pool; only a real connect does.
++    if (!CheckPerTicketsAndPayouts(block, *per, pindex, m_blockman, params.GetConsensus(), state, per_payouts, /*drop_pool=*/!fJustCheck)) {
++        return false;
++    }
++    const PerState per_expected{PerNextState(*prev_per, pindex->nHeight, nFees, per->block_tickets, params.GetConsensus())};
++    if (!(per->state == per_expected)) {
++        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-per-state", "PER reservoir state does not follow from the previous block");
++    }
++    CAmount blockReward = (nFees - PerFeeShare(nFees)) + GetBlockSubsidy(pindex->nHeight, params.GetConsensus()) + per_payouts;
+     if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
+         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+@@ -2653,6 +2674,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+         return true;
+     }
+ 
++    CachePerState(pindex, per_expected);
++
+     if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
+         return false;
+     }
+-- 
+2.53.0.windows.3
+

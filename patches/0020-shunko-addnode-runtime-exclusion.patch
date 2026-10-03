@@ -1,0 +1,47 @@
+From e98eb5fa203c3c5d26b8c141e3e712d7ddf98d71 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 20/20] shunko: exclude runtime addnode targets while they are
+ disconnected
+
+Patch 0019 promised that the automatic Shunko path skips nodes added with the
+addnode RPC whether or not they are connected. That did not hold while such a
+node was down: CConnman::GetAddedNodeInfo only fills resolvedAddress for
+currently connected peers, so the code pushed a default (invalid) address into
+the exclusion list and the real address stayed selectable.
+
+Remember the configured string as well (Lookup without DNS, as for -connect),
+and skip an invalid resolvedAddress. Startup -connect/-addnode/-seednode
+behavior is unchanged.
+
+Regression: tests/shunko_regtest.py [6b] now also restarts the node without
+-connect, adds the dead onion with the addnode RPC, and asserts the automatic
+path still reports "No known nodes" while the explicit path accepts it.
+---
+ src/rpc/mempool.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index ea61b3a..c9a07a9 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -288,7 +288,16 @@ static RPCHelpMan shunkobroadcast()
+                 for (const std::string& s : gArgs.GetArgs("-seednode")) remember_configured(s);
+                 if (node.connman) {
+                     for (const AddedNodeInfo& info : node.connman->GetAddedNodeInfo(/*include_connected=*/true)) {
+-                        configured.push_back(static_cast<const CNetAddr&>(info.resolvedAddress));
++                        // A disconnected added node has no resolved address:
++                        // GetAddedNodeInfo only fills resolvedAddress for peers
++                        // that are currently connected. Remember the configured
++                        // string as well, so a node added at runtime with the
++                        // addnode RPC is excluded while it is down too. The
++                        // string resolves without DNS for IPs and .onion names.
++                        if (info.resolvedAddress.IsValid()) {
++                            configured.push_back(static_cast<const CNetAddr&>(info.resolvedAddress));
++                        }
++                        remember_configured(info.m_params.m_added_node);
+                     }
+                 }
+                 const auto is_configured = [&](const CService& s) {
+-- 
+2.43.0
+

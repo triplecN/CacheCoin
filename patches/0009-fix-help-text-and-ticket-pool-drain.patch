@@ -1,0 +1,58 @@
+From 73132ed6685649204556bba51e03dd6fc861a50e Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 09/20] fix the RPC help text and the ticket-pool drain
+
+v31.1 rejects an RPC description that starts with a newline, and its
+ConnectBlock breaks out of the transaction loop instead of returning, so
+the PER checks could drop a node's tickets for a block it was about to
+reject.
+---
+ src/rpc/mining.cpp | 4 ++--
+ src/validation.cpp | 9 ++++++++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index a9df0c8..f9dce6b 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1182,7 +1182,7 @@ static RPCHelpMan submitheader()
+ static RPCHelpMan getperinfo()
+ {
+     return RPCHelpMan{"getperinfo",
+-        "\nReturns the PER epoch reservoir state after a block (default: the active tip).\n",
++        "Returns the PER epoch reservoir state after a block (default: the active tip).\n",
+         {
+             {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"the active tip"}, "Block whose state to show"},
+         },
+@@ -1232,7 +1232,7 @@ static RPCHelpMan getperinfo()
+ static RPCHelpMan generateperticket()
+ {
+     return RPCHelpMan{"generateperticket",
+-        "\nMine one PER entropy ticket for the given payout address, anchored to the current tip,\n"
++        "Mine one PER entropy ticket for the given payout address, anchored to the current tip,\n"
+         "and add it to this node's pool so the next block can embed it. For CPU miners who want a\n"
+         "share of the epoch reservoir without having to find a full block.\n",
+         {
+diff --git a/src/validation.cpp b/src/validation.cpp
+index fd11413..6b61d3f 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2640,7 +2640,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+     CAmount per_payouts{0};
+     // TestBlockValidity (fJustCheck, run for every template) must not drain
+     // the ticket pool; only a real connect does.
+-    if (!CheckPerTicketsAndPayouts(block, *per, pindex, m_blockman, params.GetConsensus(), state, per_payouts, /*drop_pool=*/!fJustCheck)) {
++// When the transactions are already invalid this function used to return
++// before the reservoir side effect below, so it was unreachable for such a
++// block. Upstream now breaks out of the loop instead, so the PER checks run
++// for a block that will be rejected. Skip them, or this node would drop its
++// own tickets for a candidate block it is about to refuse anyway.
++if (state.IsValid() &&
++        !CheckPerTicketsAndPayouts(block, *per, pindex, m_blockman, params.GetConsensus(),
++                               state, per_payouts, /*drop_pool=*/!fJustCheck)) {
+         return false;
+     }
+     const PerState per_expected{PerNextState(*prev_per, pindex->nHeight, nFees, per->block_tickets, params.GetConsensus())};
+-- 
+2.53.0.windows.3
+

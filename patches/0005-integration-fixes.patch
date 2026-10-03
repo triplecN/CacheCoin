@@ -1,0 +1,99 @@
+From 750154b0f56c19c65810e4ce8eb580c65cc7575a Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 05/20] integration fixes for RandomX and the
+ re-org barrier
+
+Chainparams base flags, the RandomX integration points that the CMake build
+moved, and the compact-block proof-of-work check outside cs_main.
+---
+ src/chainparamsbase.cpp    |  4 ++--
+ src/kernel/chainparams.cpp | 12 ------------
+ src/net_processing.cpp     | 13 ++++++++++---
+ 3 files changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index 7554bb5..17b873c 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -21,8 +21,8 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+     argsman.AddArg("-testnet4", "Disabled: CacheCoin has no public test network (use -regtest).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (regtest-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-signet", "Disabled: CacheCoin has no public test network (use -regtest).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+-    argsman.AddArg("-signetchallenge", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS | ArgsManager::DEBUG_ONLY);
+-    argsman.AddArg("-signetseednode", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS | ArgsManager::DEBUG_ONLY);
++    argsman.AddArg("-signetchallenge", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-signetseednode", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+ }
+ 
+ static std::unique_ptr<CBaseChainParams> globalChainBaseParams;
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index dd205f1..62579a9 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -189,11 +189,6 @@ public:
+ 
+         // Genesis checkpoint:
+         // Height 0: CacheCoin Genesis Block
+-        checkpointData = {
+-            {
+-                { 0, uint256{"1bc3387d50988b4b653389516f1d2b3672cffef48f124a3b8ff7b1ac3c1e3efa"}},
+-            }
+-        };
+ 
+         chainTxData = ChainTxData{
+             // Data from RPC: getchaintxstats 4096 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+@@ -205,7 +200,6 @@ public:
+         // No history yet (Bitcoin's figures would make verificationprogress report ~0%).
+         chainTxData = ChainTxData{
+             .nTime    = 0,
+-            .nTxCount = 0,
+             .dTxRate  = 0,
+         };
+     }
+@@ -393,7 +387,6 @@ public:
+ 
+         bech32_hrp = "tb";
+ 
+-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_testnet4), std::end(chainparams_seed_testnet4));
+ 
+         fDefaultConsistencyChecks = false;
+         m_is_mockable_chain = false;
+@@ -642,11 +635,6 @@ public:
+         fDefaultConsistencyChecks = true;
+         m_is_mockable_chain = true;
+ 
+-        checkpointData = {
+-            {
+-                {0, uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"}},
+-            }
+-        };
+ 
+         // CacheCoin: Bitcoin's regtest UTXO snapshots do not exist on this chain.
+         m_assumeutxo_data = {};
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 7d68b42..367b579 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4603,9 +4603,16 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+ 
+         // CacheCoin: check a new header's RandomX proof of work here, outside cs_main
+         // (ProcessNewBlockHeaders would hash it while holding cs_main). A pass is cached.
+-        if (received_new_header && !HasValidProofOfWork({cmpctblock.header}, m_chainparams.GetConsensus())) {
+-            Misbehaving(*peer, 100, "invalid header via cmpctblock");
+-            return;
++        if (received_new_header) {
++            // v31.1: HasValidProofOfWork takes std::span<const CBlockHeader>, so a
++            // braced-init-list no longer converts; an explicit array is required.
++            const std::array<CBlockHeader, 1> cmpctblock_headers{cmpctblock.header};
++            if (!HasValidProofOfWork(cmpctblock_headers, m_chainparams.GetConsensus())) {
++                // v31.1: Misbehaving() lost its 'howmuch' argument, and 'peer' is
++                // already a reference in this scope.
++                Misbehaving(peer, "invalid header via cmpctblock");
++                return;
++            }
+         }
+ 
+         const CBlockIndex *pindex = nullptr;
+-- 
+2.53.0.windows.3
+

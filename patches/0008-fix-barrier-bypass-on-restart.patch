@@ -1,0 +1,38 @@
+From c8bf7f330e1905b0df99cbb02b14bae95a091b05 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 08/20] fix the re-org barrier bypass on restart
+
+LoadingBlocks() is also true during the import that runs at every start-up,
+so testing it disabled the barrier after any restart. Test
+!m_blockfiles_indexed instead, which only -reindex sets.
+---
+ src/validation.cpp | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/src/validation.cpp b/src/validation.cpp
+index a8dc0ab..fd11413 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3245,13 +3245,12 @@ static bool ReorgPermitted(const CBlockIndex* reference, const CBlockIndex* cand
+ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+ {
+     AssertLockHeld(::cs_main);
+-    // CacheCoin: the barrier is off while this node is still catching up with the network
+-    // (still in initial block download and either no tip, or a tip older than -maxtipage)
+-    // and while blocks are being loaded (import or -reindex), so a syncing node follows
+-    // the most-work chain. Unlike a bare IsInitialBlockDownload() test, the block import
+-    // that runs at every start-up does not count, so a branch refused before a restart
+-    // stays refused.
+-    const bool barrier_off{m_blockman.LoadingBlocks() ||
++    // Only -reindex disables the barrier. m_blockman.LoadingBlocks() must not be used
++    // here: it is also true during the block import that runs at every start-up, which
++    // would make a restart a universal bypass for this barrier. A branch refused before a
++    // restart has to stay refused.
++    const bool reindexing{!m_blockman.m_blockfiles_indexed};
++    const bool barrier_off{reindexing ||
+         (m_chainman.IsInitialBlockDownload() &&
+          !m_chain.IsTipRecent(m_chainman.MinimumChainWork(), m_chainman.m_options.max_tip_age))};
+     if (barrier_off) reorg_reference = nullptr;
+-- 
+2.53.0.windows.3
+

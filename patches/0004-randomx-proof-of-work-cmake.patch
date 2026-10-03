@@ -1,0 +1,513 @@
+From f80fa49d8850c205f03c2e4b3844ba56b880462d Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 04/20] RandomX proof of work (CMake)
+
+RandomX v1 in light mode over the 80-byte header replaces SHA256d as the
+proof of work, with a startup known-answer self-test and a hard failure if
+the library is missing.
+---
+ CMakeLists.txt                 |  43 ++++++++
+ src/crypto/CMakeLists.txt      |   9 ++
+ src/crypto/randomx_wrapper.cpp | 185 +++++++++++++++++++++++++++++++++
+ src/crypto/randomx_wrapper.h   |  52 +++++++++
+ src/init.cpp                   |   9 ++
+ src/kernel/CMakeLists.txt      |   8 ++
+ src/node/blockstorage.cpp      |  17 ++-
+ src/primitives/block.cpp       |  21 ++++
+ src/primitives/block.h         |   2 +
+ src/rpc/mining.cpp             |   6 +-
+ 10 files changed, 347 insertions(+), 5 deletions(-)
+ create mode 100644 src/crypto/randomx_wrapper.cpp
+ create mode 100644 src/crypto/randomx_wrapper.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6109639..0c30321 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -616,6 +616,49 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.29)
+   set(CMAKE_SKIP_TEST_ALL_DEPENDENCY FALSE)
+ endif()
+ 
++#=============================
++# CacheCoin: RandomX proof-of-work
++#=============================
++# CacheCoin replaces SHA256d with RandomX v1 (light mode) as the proof-of-work hash.
++# RandomX is a separate upstream project (tevador/RandomX), pinned to an exact commit
++# and built by scripts/build_linux.sh *before* Bitcoin Core is configured, so it is
++# consumed here as a prebuilt static library rather than with add_subdirectory():
++# RandomX's own CMakeLists.txt would additionally create an install() rule and three
++# executables (randomx-tests, randomx-codegen, randomx-benchmark) that this build does
++# not want. The `randomx` target defined below replaces the three autotools hunks of
++# patches/0003-randomx-proof-of-work.patch: the -I for randomx/src, the
++# crypto/randomx_wrapper.{h,cpp} sources, and the librandomx.a on the link line.
++option(CACHECOIN_RANDOMX "Build CacheCoin's RandomX proof of work. ON consumes the pinned RandomX checkout under src/crypto/randomx; OFF expects a system-installed RandomX." ON)
++set(CACHECOIN_RANDOMX_ROOT "${PROJECT_SOURCE_DIR}/src/crypto/randomx" CACHE PATH "Root of the pinned RandomX checkout (provides src/randomx.h and build/librandomx.a).")
++if(CACHECOIN_RANDOMX)
++  if(NOT EXISTS "${CACHECOIN_RANDOMX_ROOT}/src/randomx.h")
++    message(FATAL_ERROR "CacheCoin: RandomX headers not found at '${CACHECOIN_RANDOMX_ROOT}/src/randomx.h'. RandomX is consensus-critical and is not vendored: build it first (see scripts/build_linux.sh), point -DCACHECOIN_RANDOMX_ROOT=<path> at an existing checkout, or configure with -DCACHECOIN_RANDOMX=OFF to use a system-installed RandomX.")
++  endif()
++  set(_cachecoin_randomx_archive "${CACHECOIN_RANDOMX_ROOT}/build/${CMAKE_STATIC_LIBRARY_PREFIX}randomx${CMAKE_STATIC_LIBRARY_SUFFIX}")
++  if(NOT EXISTS "${_cachecoin_randomx_archive}")
++    message(FATAL_ERROR "CacheCoin: prebuilt librandomx.a not found at '${_cachecoin_randomx_archive}'. RandomX must be built (and self-tested) before configuring Bitcoin Core; see scripts/build_linux.sh.")
++  endif()
++  add_library(randomx STATIC IMPORTED GLOBAL)
++  set_target_properties(randomx PROPERTIES
++    IMPORTED_LOCATION "${_cachecoin_randomx_archive}"
++    INTERFACE_INCLUDE_DIRECTORIES "${CACHECOIN_RANDOMX_ROOT}/src"
++  )
++  message(STATUS "CacheCoin: using RandomX from ${CACHECOIN_RANDOMX_ROOT}")
++else()
++  find_path(CACHECOIN_RANDOMX_INCLUDE_DIR randomx.h)
++  find_library(CACHECOIN_RANDOMX_LIBRARY NAMES randomx)
++  if(NOT CACHECOIN_RANDOMX_INCLUDE_DIR OR NOT CACHECOIN_RANDOMX_LIBRARY)
++    message(FATAL_ERROR "CacheCoin: -DCACHECOIN_RANDOMX=OFF requires a system-installed RandomX, but randomx.h and/or librandomx were not found. RandomX is consensus-critical and has no fallback algorithm.")
++  endif()
++  add_library(randomx STATIC IMPORTED GLOBAL)
++  set_target_properties(randomx PROPERTIES
++    IMPORTED_LOCATION "${CACHECOIN_RANDOMX_LIBRARY}"
++    INTERFACE_INCLUDE_DIRECTORIES "${CACHECOIN_RANDOMX_INCLUDE_DIR}"
++  )
++  message(STATUS "CacheCoin: using system RandomX ${CACHECOIN_RANDOMX_LIBRARY}")
++endif()
++unset(_cachecoin_randomx_archive)
++
+ add_subdirectory(test)
+ add_subdirectory(doc)
+ 
+diff --git a/src/crypto/CMakeLists.txt b/src/crypto/CMakeLists.txt
+index 92653ad..ceaa3b0 100644
+--- a/src/crypto/CMakeLists.txt
++++ b/src/crypto/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
+   hmac_sha512.cpp
+   muhash.cpp
+   poly1305.cpp
++  randomx_wrapper.cpp
+   ripemd160.cpp
+   sha1.cpp
+   sha256.cpp
+@@ -27,6 +28,14 @@ target_link_libraries(bitcoin_crypto
+     core_interface
+ )
+ 
++if(CACHECOIN_RANDOMX)
++  # CacheCoin: crypto/randomx_wrapper.cpp (above) is the RandomX proof-of-work, which is
++  # consensus-critical. PUBLIC rather than PRIVATE because bitcoin_crypto is a static
++  # library: librandomx.a must reach the link line of every consumer, and so must the
++  # randomx/src include directory.
++  target_link_libraries(bitcoin_crypto PUBLIC randomx)
++endif()
++
+ if(HAVE_SSE41)
+   target_compile_definitions(bitcoin_crypto PRIVATE ENABLE_SSE41)
+   target_sources(bitcoin_crypto PRIVATE sha256_sse41.cpp)
+diff --git a/src/crypto/randomx_wrapper.cpp b/src/crypto/randomx_wrapper.cpp
+new file mode 100644
+index 0000000..2548eee
+--- /dev/null
++++ b/src/crypto/randomx_wrapper.cpp
+@@ -0,0 +1,185 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <crypto/randomx_wrapper.h>
++
++#include <randomx.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#ifndef _WIN32
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++
++namespace {
++
++// Consensus key of the RandomX cache. Changing it changes the proof-of-work of every
++// block, including genesis (nonce 1349294 was found with this key).
++constexpr char RANDOMX_POW_KEY[] = "CacheCoin CCCN Genesis Seed Key";
++
++[[noreturn]] void RandomXFatal(const char* what)
++{
++    std::fprintf(stderr, "CacheCoin: fatal RandomX error: %s. Refusing to continue without the consensus proof-of-work.\n", what);
++    std::abort();
++}
++
++/**
++ * Whether this process may turn freshly written memory into executable code, which the
++ * RandomX JIT needs. Hardened systems refuse that (systemd MemoryDenyWriteExecute, SELinux
++ * execmem, PaX MPROTECT), and the RandomX library ignores the refusal (it discards the
++ * mprotect result), so the first jump into JIT code would crash the node with SIGSEGV.
++ * Probe the same transitions RANDOMX_FLAG_SECURE uses: read-write -> read-execute -> read-write.
++ */
++bool JitMemoryAllowed()
++{
++#ifdef _WIN32
++    return true;
++#else
++    const long page_size{sysconf(_SC_PAGESIZE)};
++    if (page_size <= 0) return false;
++    void* page{mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)};
++    if (page == MAP_FAILED) return false;
++    const bool to_exec{mprotect(page, page_size, PROT_READ | PROT_EXEC) == 0};
++    const bool to_write{to_exec && mprotect(page, page_size, PROT_READ | PROT_WRITE) == 0};
++    munmap(page, page_size);
++    return to_exec && to_write;
++#endif
++}
++
++class RandomXContext
++{
++public:
++    RandomXContext()
++    {
++        // CPU feature flags (JIT, AES, Argon2 variants) only change speed, never the hash.
++        // RANDOMX_FLAG_V2 selects a different algorithm and must never be set: CacheCoin
++        // consensus is RandomX v1.
++        m_flags = static_cast<randomx_flags>(randomx_get_flags() & ~RANDOMX_FLAG_V2);
++        if (m_flags & RANDOMX_FLAG_JIT) {
++            const char* no_jit{std::getenv("CACHECOIN_RANDOMX_NOJIT")};
++            if (no_jit != nullptr && *no_jit != '\0' && std::strcmp(no_jit, "0") != 0) {
++                m_flags = static_cast<randomx_flags>(m_flags & ~(RANDOMX_FLAG_JIT | RANDOMX_FLAG_SECURE));
++                m_mode = "interpreter (CACHECOIN_RANDOMX_NOJIT is set)";
++            } else if (!JitMemoryAllowed()) {
++                m_flags = static_cast<randomx_flags>(m_flags & ~(RANDOMX_FLAG_JIT | RANDOMX_FLAG_SECURE));
++                m_mode = "interpreter (this system does not allow JIT memory)";
++            } else {
++                // W^X: generated code pages are writable or executable, never both at once.
++                m_flags = static_cast<randomx_flags>(m_flags | RANDOMX_FLAG_SECURE);
++                m_mode = "JIT (W^X)";
++            }
++        } else {
++            m_mode = "interpreter (no JIT for this CPU)";
++        }
++        m_cache = randomx_alloc_cache(m_flags);
++        if (m_cache == nullptr) {
++            m_flags = RANDOMX_FLAG_DEFAULT;
++            m_mode = "interpreter (cache allocation with CPU-specific flags failed)";
++            m_cache = randomx_alloc_cache(m_flags);
++        }
++        if (m_cache == nullptr) RandomXFatal("cannot allocate the 256 MiB RandomX cache");
++        randomx_init_cache(m_cache, RANDOMX_POW_KEY, sizeof(RANDOMX_POW_KEY) - 1);
++    }
++
++    // RandomX VMs are not thread-safe, so every concurrent caller takes its own VM from
++    // this pool. The pool only grows to the number of threads that hash at the same time.
++    randomx_vm* Acquire()
++    {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (!m_free.empty()) {
++                randomx_vm* vm = m_free.back();
++                m_free.pop_back();
++                return vm;
++            }
++        }
++        randomx_vm* vm = randomx_create_vm(m_flags, m_cache, nullptr);
++        if (vm == nullptr) {
++            // The interpreter produces identical hashes if a JIT VM cannot be created.
++            const auto no_jit = static_cast<randomx_flags>(m_flags & ~(RANDOMX_FLAG_JIT | RANDOMX_FLAG_SECURE));
++            vm = randomx_create_vm(no_jit, m_cache, nullptr);
++        }
++        if (vm == nullptr) RandomXFatal("cannot create a RandomX virtual machine");
++        return vm;
++    }
++
++    // Cap idle VMs: the pool would otherwise grow to peak concurrency ever seen
++    // and hold it forever (each idle VM pins megabytes of scratchpad).
++    static constexpr size_t MAX_IDLE_VMS{16};
++    void Release(randomx_vm* vm)
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (m_free.size() >= MAX_IDLE_VMS) {
++            randomx_destroy_vm(vm);
++            return;
++        }
++        m_free.push_back(vm);
++    }
++
++    const std::string& Mode() const { return m_mode; }
++
++private:
++    randomx_flags m_flags{RANDOMX_FLAG_DEFAULT};
++    std::string m_mode;
++    randomx_cache* m_cache{nullptr};
++    std::mutex m_mutex;
++    std::vector<randomx_vm*> m_free;
++};
++
++RandomXContext& GetContext()
++{
++    // Intentionally never destroyed: validation and RPC threads may still be hashing
++    // while static destructors run at shutdown.
++    static RandomXContext* const ctx = new RandomXContext();
++    return *ctx;
++}
++
++} // namespace
++
++RandomXEngine& RandomXEngine::GetInstance()
++{
++    static RandomXEngine instance;
++    return instance;
++}
++
++std::vector<uint8_t> RandomXEngine::CalculateHash(const uint8_t* data, size_t len)
++{
++    RandomXContext& ctx = GetContext();
++    randomx_vm* vm = ctx.Acquire();
++    std::vector<uint8_t> out(RANDOMX_HASH_SIZE);
++    randomx_calculate_hash(vm, data, len, out.data());
++    ctx.Release(vm);
++    return out;
++}
++
++bool RandomXSelfTest()
++{
++    // The CacheCoin mainnet genesis header (nonce 1349294) and its RandomX digest, which
++    // meets the genesis target 0x1e0ffff0. Computed with the JIT, the interpreter and the
++    // portable build; they must all agree.
++    static constexpr uint8_t GENESIS_HEADER[80] = {
++        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0xd8, 0x5e, 0xaf, 0xf5, 0xf4, 0x32, 0xf2, 0x09, 0x42, 0xeb, 0xe7, 0xac,
++        0xa4, 0x58, 0x19, 0xb8, 0x20, 0x20, 0xcb, 0x1a, 0xc1, 0xdb, 0xd9, 0xdd, 0xe4, 0x9c, 0x67, 0xde,
++        0x91, 0xc3, 0x80, 0x3c, 0x8e, 0xbc, 0xb6, 0x6a, 0xf0, 0xff, 0x0f, 0x1e, 0xae, 0x96, 0x14, 0x00,
++    };
++    static constexpr uint8_t GENESIS_POW_HASH[32] = {
++        0xe4, 0x35, 0x3b, 0xfd, 0x11, 0x83, 0x23, 0x5a, 0x27, 0xe2, 0x23, 0xc3, 0x43, 0x1f, 0xc4, 0x4f,
++        0x7b, 0x29, 0xa4, 0x9f, 0x89, 0xa6, 0x00, 0xd3, 0x08, 0xaf, 0x63, 0x27, 0xfb, 0x0e, 0x00, 0x00,
++    };
++    const std::vector<uint8_t> hash{RandomXEngine::GetInstance().CalculateHash(GENESIS_HEADER, sizeof(GENESIS_HEADER))};
++    return hash.size() == sizeof(GENESIS_POW_HASH) && std::memcmp(hash.data(), GENESIS_POW_HASH, sizeof(GENESIS_POW_HASH)) == 0;
++}
++
++std::string RandomXModeDescription()
++{
++    return GetContext().Mode();
++}
+diff --git a/src/crypto/randomx_wrapper.h b/src/crypto/randomx_wrapper.h
+new file mode 100644
+index 0000000..dc98554
+--- /dev/null
++++ b/src/crypto/randomx_wrapper.h
+@@ -0,0 +1,52 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_CRYPTO_RANDOMX_WRAPPER_H
++#define BITCOIN_CRYPTO_RANDOMX_WRAPPER_H
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++/**
++ * CacheCoin proof-of-work: RandomX v1 (tevador/RandomX) in light mode over the
++ * 80-byte serialized block header, with a fixed consensus key (see the .cpp).
++ *
++ * Consensus-critical. Every node must compute exactly this function, so there is
++ * deliberately no fallback algorithm: if RandomX cannot be initialised the process
++ * aborts instead of silently validating blocks with a different hash.
++ *
++ * The JIT compiler is used when the system allows JIT memory, with W^X pages
++ * (RANDOMX_FLAG_SECURE); otherwise, or when the environment variable
++ * CACHECOIN_RANDOMX_NOJIT is set, the interpreter runs. Both give identical hashes.
++ *
++ * Thread-safe: each concurrent caller borrows its own RandomX VM; all VMs share one
++ * read-only 256 MiB cache, so hashing on one thread never blocks another.
++ */
++class RandomXEngine
++{
++public:
++    static RandomXEngine& GetInstance();
++
++    /** Return the 32-byte RandomX hash of data[0..len). */
++    std::vector<uint8_t> CalculateHash(const uint8_t* data, size_t len);
++
++private:
++    RandomXEngine() = default;
++    RandomXEngine(const RandomXEngine&) = delete;
++    RandomXEngine& operator=(const RandomXEngine&) = delete;
++};
++
++/**
++ * Known-answer test: hash the mainnet genesis header and compare the result with its
++ * known RandomX digest. False means this build computes a different function on this
++ * system (for example a miscompiled library), so it must not validate blocks.
++ */
++bool RandomXSelfTest();
++
++/** How RandomX runs on this system (JIT or interpreter, and why), for the log. */
++std::string RandomXModeDescription();
++
++#endif // BITCOIN_CRYPTO_RANDOMX_WRAPPER_H
+diff --git a/src/init.cpp b/src/init.cpp
+index 2b9b142..c092a19 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -20,6 +20,7 @@
+ #include <common/system.h>
+ #include <consensus/amount.h>
+ #include <consensus/consensus.h>
++#include <crypto/randomx_wrapper.h>
+ #include <deploymentstatus.h>
+ #include <hash.h>
+ #include <httprpc.h>
+@@ -1186,6 +1187,14 @@ bool AppInitSanityChecks(const kernel::Context& kernel)
+         return InitError(strprintf(_("Elliptic curve cryptography sanity check failure. %s is shutting down."), CLIENT_NAME));
+     }
+ 
++    // CacheCoin: prove that this build computes the consensus proof-of-work (RandomX v1)
++    // correctly on this machine before it validates anything.
++    if (!RandomXSelfTest()) {
++        return InitError(Untranslated("RandomX self-test failed: this build computes a wrong proof-of-work hash on this system "
++                                      "(the genesis block does not verify). Try setting CACHECOIN_RANDOMX_NOJIT=1, or rebuild. Shutting down."));
++    }
++    LogInfo("RandomX proof-of-work: %s, self-test passed\n", RandomXModeDescription());
++
+     // Probe the directory locks to give an early error message, if possible
+     // We cannot hold the directory locks here, as the forking for daemon() hasn't yet happened,
+     // and a fork will cause weird behavior to them.
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 244f009..a3f137d 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -108,6 +108,14 @@ target_link_libraries(bitcoinkernel
+     Boost::headers
+ )
+ 
++if(CACHECOIN_RANDOMX)
++  # CacheCoin: ../primitives/block.cpp (in the source list above) holds the RandomX
++  # proof-of-work and ../validation.cpp calls CBlockHeader::GetPoWHash(), so this library
++  # needs RandomX. $<TARGET_OBJECTS:bitcoin_crypto> contributes randomx_wrapper.o but
++  # drops bitcoin_crypto's transitive link libraries, so librandomx.a is named explicitly.
++  target_link_libraries(bitcoinkernel PRIVATE randomx)
++endif()
++
+ target_include_directories(bitcoinkernel PRIVATE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/leveldb/include>)
+ 
+ # Add a convenience libbitcoinkernel target as a synonym for bitcoinkernel.
+diff --git a/src/node/blockstorage.cpp b/src/node/blockstorage.cpp
+index ab6d23e..af6a62b 100644
+--- a/src/node/blockstorage.cpp
++++ b/src/node/blockstorage.cpp
+@@ -145,8 +145,12 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
+                 pindexNew->nStatus        = diskindex.nStatus;
+                 pindexNew->nTx            = diskindex.nTx;
+ 
+-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+-                    LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
++                // CacheCoin: every header in the index had its RandomX proof-of-work verified
++                // when it was first accepted. Recomputing RandomX (~25 ms per header in light
++                // mode) for the whole chain on every start would take hours as the chain grows,
++                // so only the target encoding is sanity-checked here.
++                if (!CheckProofOfWorkRange(pindexNew->nBits, consensusParams)) {
++                    LogError("%s: CheckProofOfWorkRange failed: %s\n", __func__, pindexNew->ToString());
+                     return false;
+                 }
+ 
+@@ -1053,8 +1057,13 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
+ 
+     const auto block_hash{block.GetHash()};
+ 
+-    // Check the header
+-    if (!CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
++    // Check the header.
++    // CacheCoin: the proof-of-work is RandomX (CBlockHeader::GetPoWHash), not the SHA256d
++    // block id, so checking GetHash() against the target would reject almost every block.
++    // Blocks on disk were fully validated before being stored, and the caller that knows
++    // the block index additionally compares block_hash with it, so only the target encoding
++    // is checked here instead of recomputing RandomX for every read.
++    if (!CheckProofOfWorkRange(block.nBits, GetConsensus())) {
+         LogError("Errors in block header at %s while reading block", pos.ToString());
+         return false;
+     }
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index dfeed29..0e2c371 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -5,9 +5,13 @@
+ 
+ #include <primitives/block.h>
+ 
++#include <crypto/randomx_wrapper.h>
+ #include <hash.h>
++#include <streams.h>
+ #include <tinyformat.h>
+ 
++#include <cassert>
++#include <cstring>
+ #include <memory>
+ #include <span>
+ #include <sstream>
+@@ -32,3 +36,20 @@ std::string CBlock::ToString() const
+     }
+     return s.str();
+ }
++
++uint256 CBlockHeader::GetPoWHash() const
++{
++    // CacheCoin: CDataStream is gone in v31.x, but the consensus input is unchanged: the
++    // 80-byte serialization of the header, hashed with RandomX v1.
++    DataStream ss{};
++    ss << *this;
++    assert(ss.size() == 80);
++
++    std::vector<uint8_t> pow_digest = RandomXEngine::GetInstance().CalculateHash(
++        reinterpret_cast<const uint8_t*>(ss.data()), ss.size()
++    );
++
++    uint256 result;
++    std::memcpy(result.begin(), pow_digest.data(), 32);
++    return result;
++}
+diff --git a/src/primitives/block.h b/src/primitives/block.h
+index 8ca4fb4..8be5599 100644
+--- a/src/primitives/block.h
++++ b/src/primitives/block.h
+@@ -57,6 +57,8 @@ public:
+     }
+ 
+     uint256 GetHash() const;
++    /** Computes the memory-hard CPU PoW hash via RandomX */
++    uint256 GetPoWHash() const;
+ 
+     NodeSeconds Time() const
+     {
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 043e11f..36dbc5c 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -25,6 +25,7 @@
+ #include <node/warnings.h>
+ #include <policy/ephemeral_policy.h>
+ #include <pow.h>
++#include <random.h>
+ #include <rpc/blockchain.h>
+ #include <rpc/mining.h>
+ #include <rpc/server.h>
+@@ -138,8 +139,11 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
+ {
+     block_out.reset();
+     block.hashMerkleRoot = BlockMerkleRoot(block);
++    // CacheCoin: start from a random nonce, so parallel generatetoaddress calls that got the
++    // same template (same second, same transactions) do not hash the same headers.
++    block.nNonce = FastRandomContext().rand32() >> 1;
+ 
+-    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
++    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetPoWHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
+         ++block.nNonce;
+         --max_tries;
+     }
+-- 
+2.53.0.windows.3
+

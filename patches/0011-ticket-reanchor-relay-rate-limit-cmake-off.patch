@@ -1,0 +1,250 @@
+From 33c51965005e986501ab7e1d74a126a36ffde0b3 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 11/20] re-anchor ticket mining, relay rate limit, CMake OFF
+ build
+
+generateperticket mines in 1024-nonce slices anchored to the current tip,
+so a ticket found after a long search is still valid. The perticket rate
+limiter no longer charges for tickets the node already has, randomx is
+linked in both CACHECOIN_RANDOMX configurations, and a failed history read
+is no longer cached.
+---
+ src/crypto/CMakeLists.txt | 14 ++++++-------
+ src/kernel/CMakeLists.txt | 13 ++++++------
+ src/net_processing.cpp    |  9 +++++++-
+ src/node/types.h          | 13 +++++++-----
+ src/per.cpp               | 29 +++++++++++++++++++++-----
+ src/rpc/mining.cpp        | 44 +++++++++++++++++++++++++++------------
+ 6 files changed, 84 insertions(+), 38 deletions(-)
+
+diff --git a/src/crypto/CMakeLists.txt b/src/crypto/CMakeLists.txt
+index ceaa3b0..d956043 100644
+--- a/src/crypto/CMakeLists.txt
++++ b/src/crypto/CMakeLists.txt
+@@ -28,13 +28,13 @@ target_link_libraries(bitcoin_crypto
+     core_interface
+ )
+ 
+-if(CACHECOIN_RANDOMX)
+-  # CacheCoin: crypto/randomx_wrapper.cpp (above) is the RandomX proof-of-work, which is
+-  # consensus-critical. PUBLIC rather than PRIVATE because bitcoin_crypto is a static
+-  # library: librandomx.a must reach the link line of every consumer, and so must the
+-  # randomx/src include directory.
+-  target_link_libraries(bitcoin_crypto PUBLIC randomx)
+-endif()
++# CacheCoin: crypto/randomx_wrapper.cpp (above) is the RandomX proof-of-work, which is
++# consensus-critical and is compiled in both CACHECOIN_RANDOMX configurations (the option
++# only selects where the library comes from). PUBLIC rather than PRIVATE because
++# bitcoin_crypto is a static library: librandomx.a must reach the link line of every
++# consumer, and so must the randomx include directory. Linking it unconditionally is what
++# makes -DCACHECOIN_RANDOMX=OFF (system-installed RandomX) build at all.
++target_link_libraries(bitcoin_crypto PUBLIC randomx)
+ 
+ if(HAVE_SSE41)
+   target_compile_definitions(bitcoin_crypto PRIVATE ENABLE_SSE41)
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index a3f137d..c200d19 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -108,13 +108,12 @@ target_link_libraries(bitcoinkernel
+     Boost::headers
+ )
+ 
+-if(CACHECOIN_RANDOMX)
+-  # CacheCoin: ../primitives/block.cpp (in the source list above) holds the RandomX
+-  # proof-of-work and ../validation.cpp calls CBlockHeader::GetPoWHash(), so this library
+-  # needs RandomX. $<TARGET_OBJECTS:bitcoin_crypto> contributes randomx_wrapper.o but
+-  # drops bitcoin_crypto's transitive link libraries, so librandomx.a is named explicitly.
+-  target_link_libraries(bitcoinkernel PRIVATE randomx)
+-endif()
++# CacheCoin: ../primitives/block.cpp (in the source list above) holds the RandomX
++# proof-of-work and ../validation.cpp calls CBlockHeader::GetPoWHash(), so this library
++# needs RandomX in both CACHECOIN_RANDOMX configurations. $<TARGET_OBJECTS:bitcoin_crypto>
++# contributes randomx_wrapper.o but drops bitcoin_crypto's transitive link libraries, so
++# the library is named explicitly.
++target_link_libraries(bitcoinkernel PRIVATE randomx)
+ 
+ target_include_directories(bitcoinkernel PRIVATE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/leveldb/include>)
+ 
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 24a0289..4587ba1 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -5006,6 +5006,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+         uint32_t anchor_nbits{0};
+         {
+             LOCK(cs_main);
++            // A ticket this node already holds is not hashed again, so it must not
++            // spend rate-limit tokens either. Every peer relays each new ticket to
++            // all of its peers, including the one it came from, so counting those
++            // echoes as a flood would disconnect honest peers during a ticket burst.
++            // The check costs one hash and a map lookup, so a peer that spams ids
++            // this node already has stays cheap to ignore; the RandomX budget is
++            // kept for tickets that are actually new.
++            if (PerPoolHas(ticket.Id())) return;
+             // The bucket lives on the Peer, so a new TCP connection restarts it at
+             // the cap, and the initial value has to match the cap or the first
+             // message of every connection would be charged the old, larger one.
+@@ -5049,7 +5057,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+                     return;
+                 }
+             }
+-            if (PerPoolHas(ticket.Id())) return; // already have it; do not re-verify or loop
+             const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+             if (!tip) return;
+             const CBlockIndex* anchorIdx{m_chainman.m_blockman.LookupBlockIndex(ticket.anchor)};
+diff --git a/src/node/types.h b/src/node/types.h
+index 01e7452..aa6b17b 100644
+--- a/src/node/types.h
++++ b/src/node/types.h
+@@ -141,16 +141,19 @@ struct CoinbaseTx {
+      */
+     std::optional<uint256> witness;
+     /**
+-     * Block subsidy plus fees, minus any non-zero required_outputs.
++     * The part of the block reward not spent by required_outputs.
+      *
+-     * Currently there are no non-zero required_outputs, so block_reward_remaining
+-     * is the entire block reward. See also required_outputs.
++     * CacheCoin PER: the miner claims subsidy + fees - fees/2, and the reservoir
++     * payout outputs in required_outputs carry their own value, funded by the
++     * reservoir rather than by this remainder. So this is the miner's own output
++     * value; the full coinbase limit is this plus the value of the non-zero
++     * required_outputs. See also required_outputs.
+      */
+     CAmount block_reward_remaining;
+     /*
+      * To be included as the last outputs in the coinbase transaction.
+-     * Currently this is only the witness commitment OP_RETURN, but future
+-     * softforks or a custom mining patch could add more.
++     * CacheCoin PER appends the reservoir commitment, the ticket records and the
++     * payout outputs here, ahead of the witness commitment.
+      *
+      * The dummy output that spends the full reward is excluded.
+      */
+diff --git a/src/per.cpp b/src/per.cpp
+index 3b2068b..e653d96 100644
+--- a/src/per.cpp
++++ b/src/per.cpp
+@@ -180,8 +180,20 @@ std::mutex g_embedded_mutex;
+ std::map<uint256, std::vector<uint256>> g_embedded_cache;
+ std::deque<uint256> g_embedded_order;
+ 
+-/** Ticket ids embedded by pindex's block (cached, bounded). nullopt means
+- *  the block could not be read (callers treat that as retryable, not empty). */
++/** Ticket ids embedded by pindex's block (cached, bounded).
++ *
++ *  Deliberate limitation, recorded so it is not "fixed" into a worse state: when
++ *  the block cannot be read, PerBlockTickets returns nullopt but this function
++ *  returns an EMPTY set (and caches that answer). The callers' "retryable on
++ *  nullopt" guards therefore never fire on a read failure. Propagating the nullopt
++ *  was tried and breaks template building, because a read returning nothing is
++ *  normal on the path the miner takes; that is why the behaviour stays. The
++ *  consequence is recorded in SECURITY.md ("Known accepted risks"): a read failure
++ *  disables cross-block replay detection for that window, so a replayed ticket can
++ *  be embedded twice and paid twice from the same reservoir (no inflation, but the
++ *  other ticket holders get less), and a node that hits the failure can accept a
++ *  block other nodes reject. Fixing this needs the mining path to tolerate the
++ *  nullopt first; do not flip the return value on its own. */
+ std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
+                                                     const node::BlockManager& blockman)
+ {
+@@ -194,10 +206,16 @@ std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
+         }
+     }
+     std::set<uint256> ids;
++    bool readable{false};
+     if (auto t{PerBlockTickets(pindex, blockman)}) {
++        readable = true;
+         for (const auto& x : *t) ids.insert(x.Id());
+     }
+-    {
++    // Only cache successful reads. A failed read still answers "no tickets" for this
++    // call (see the comment above), but caching that answer would keep the blind
++    // window open until the entry is evicted. Leaving it uncached makes the next
++    // caller retry the disk read, so a transient fault heals by itself.
++    if (readable) {
+         std::lock_guard<std::mutex> lock{g_embedded_mutex};
+         g_embedded_cache[hash] = std::vector<uint256>(ids.begin(), ids.end());
+         g_embedded_order.push_back(hash);
+@@ -613,8 +631,9 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+         const CBlockIndex* a{parent};
+         for (int i = 0; i < params.nPerTicketWindow && a; ++i) {
+             auto hist{EmbeddedTicketIds(a, blockman)};
+-            // Unreadable history must not silently disable replay detection
+-            // (a replay could then over-mint): retryable, like the paths above.
++            // EmbeddedTicketIds returns an empty set, not nullopt, when the block
++            // cannot be read (see its comment). Keep this guard for an eventual
++            // implementation that distinguishes the two; today it is unreachable.
+             if (!hist) return state.Error("cannot read ticket history");
+             seen.insert(hist->begin(), hist->end());
+             a = a->pprev;
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index f9dce6b..a0f24b0 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1234,10 +1234,13 @@ static RPCHelpMan generateperticket()
+     return RPCHelpMan{"generateperticket",
+         "Mine one PER entropy ticket for the given payout address, anchored to the current tip,\n"
+         "and add it to this node's pool so the next block can embed it. For CPU miners who want a\n"
+-        "share of the epoch reservoir without having to find a full block.\n",
++        "share of the epoch reservoir without having to find a full block. The search re-anchors\n"
++        "to the current tip every 1024 nonces, so a ticket found after a long search is still\n"
++        "valid. A large maxtries can hold this RPC thread for hours; a bounded value in a shell\n"
++        "loop is usually better (see deploy/README.md).\n",
+         {
+             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The CacheCoin address the ticket pays to"},
+-            {"maxtries", RPCArg::Type::NUM, RPCArg::Default{1000000}, "How many nonces to try"},
++            {"maxtries", RPCArg::Type::NUM, RPCArg::Default{1000000}, "How many nonces to try. The search re-anchors to the current tip every 1024 nonces, so a ticket found after a long search is still anchored to a recent block"},
+         },
+         RPCResult{RPCResult::Type::OBJ, "", "", {
+             {RPCResult::Type::BOOL, "found", "whether a ticket was found within maxtries"},
+@@ -1256,19 +1259,34 @@ static RPCHelpMan generateperticket()
+     uint64_t tries = request.params[1].isNull() ? 1000000 : request.params[1].getInt<uint64_t>();
+ 
+     ChainstateManager& chainman = EnsureAnyChainman(request.context);
+-    uint256 anchor;
+-    uint32_t anchor_nbits;
+     const Consensus::Params& consensus = chainman.GetConsensus();
+-    {
+-        LOCK(cs_main);
+-        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+-        // No tip yet (start-up before genesis load): refuse instead of dereferencing null.
+-        if (!tip) throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Node has no tip yet");
+-        anchor = tip->GetBlockHash();
+-        anchor_nbits = tip->nBits;
++    // Mine in slices, each anchored to the tip at the time the slice starts. A ticket
++    // is only valid while its anchor is within nPerTicketWindow blocks, so searching
++    // one fixed anchor for longer than that window would find a ticket that is already
++    // stale, and the validation below would throw it away. Re-anchoring keeps the
++    // ticket fresh when it is found; the expected work is unchanged, because the
++    // ticket target does not depend on how long a single anchor has been searched.
++    std::optional<PerTicket> ticket;
++    uint64_t remaining{tries};
++    // 1024 light-mode hashes is about 20 s on a normal CPU and about 2.5 minutes in
++    // the interpreter, both far inside the 10-block (~10 minute) anchor window.
++    constexpr uint64_t PER_ANCHOR_SLICE{1024};
++    while (remaining > 0 && !ticket && !static_cast<bool>(chainman.m_interrupt)) {
++        uint256 anchor;
++        uint32_t anchor_nbits;
++        {
++            LOCK(cs_main);
++            const CBlockIndex* tip = chainman.ActiveChain().Tip();
++            // No tip yet (start-up before genesis load): refuse instead of dereferencing null.
++            if (!tip) throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Node has no tip yet");
++            anchor = tip->GetBlockHash();
++            anchor_nbits = tip->nBits;
++        }
++        // v31.1 port: chainman.m_interrupt replaces the removed global ShutdownRequested().
++        const uint64_t slice{std::min(remaining, PER_ANCHOR_SLICE)};
++        ticket = PerMineTicket(anchor, anchor_nbits, payout, slice, consensus, &chainman.m_interrupt);
++        remaining -= slice;
+     }
+-    // v31.1 port: chainman.m_interrupt replaces the removed global ShutdownRequested().
+-    const auto ticket = PerMineTicket(anchor, anchor_nbits, payout, tries, consensus, &chainman.m_interrupt);
+ 
+     UniValue result(UniValue::VOBJ);
+     result.pushKV("found", (bool)ticket);
+-- 
+2.53.0.windows.3
+

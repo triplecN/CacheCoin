@@ -1,0 +1,270 @@
+From 3a396b5332e75b9725291a461d91d03dc2a12fc6 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 16/20] close the PER payout sigop bomb, pool drain and target
+ hygiene
+
+per: PerPayoutScriptAllowed now rejects scripts whose legacy sigop count is
+above one (and invalid opcodes). A payout script becomes a mandatory coinbase
+output one epoch later, and coinbase outputs count toward
+MAX_BLOCK_SIGOPS_COST, so a ticket whose payout script is 100 bytes of
+CHECKMULTISIG could have made every block at its payout height invalid: no
+valid block could be mined and the chain would stall permanently. This was
+reachable by relaying a few such tickets and having a miner embed them; there
+is no live chain, so the rule is tightened before launch.
+
+per: the local ticket pool is now drained by PerPoolDropEmbedded only after a
+real connect passed every PER, amount and script check. Previously
+CheckPerTicketsAndPayouts dropped the embedded tickets before the committed
+state was compared, so a block with a valid ticket slice and a wrong state was
+rejected but still removed this node's tickets from the pool.
+
+per: PerMineTicket starts at a random nonce, so a re-anchor every 1024 tries
+and repeated calls with an unchanged tip no longer recompute the same tickets.
+
+rpc/mempool: Shunko target exclusion compares the network address instead of
+IP:port, so another port of a connected peer (and an inbound peer's listening
+address) cannot be selected.
+
+shunko: the one-shot version message uses a fixed user agent instead of
+strSubVersion, so -uacomment cannot fingerprint a sender across hand-overs.
+
+consensus.h: the barrier comments now describe the height-based rule the code
+actually implements.
+---
+ src/consensus/consensus.h | 10 +++---
+ src/per.cpp               | 64 +++++++++++++++++++++++++++------------
+ src/per.h                 | 10 ++++--
+ src/rpc/mempool.cpp       |  9 +++++-
+ src/shunko.cpp            |  5 ++-
+ src/validation.cpp        | 15 +++++----
+ 6 files changed, 79 insertions(+), 34 deletions(-)
+
+diff --git a/src/consensus/consensus.h b/src/consensus/consensus.h
+index e1ea40e..5d697b9 100644
+--- a/src/consensus/consensus.h
++++ b/src/consensus/consensus.h
+@@ -19,11 +19,13 @@ static const unsigned int MAX_BLOCK_SERIALIZED_SIZE = 2000000;
+  *  serialization limit used when reading block files. */
+ static const unsigned int MAX_BLOCK_WEIGHT = 2000000;
+ static_assert(MAX_BLOCK_WEIGHT <= MAX_BLOCK_SERIALIZED_SIZE, "a block within the weight limit must fit the serialization limit");
+-/** CacheCoin anti-51% barrier: deepest chain reorganization accepted without supermajority work (network rule) */
++/** CacheCoin anti-51% barrier: deepest chain reorganization followed without the heal rule
++ *  (network rule; height-based, measured against the node's own active chain) */
+ static const int MAX_REORG_DEPTH = 5;
+-/** CacheCoin anti-51% barrier: a deeper reorganization is still accepted once the other branch
+- *  leads the active chain by this many blocks of work (at the active tip's difficulty), so nodes
+- *  split by a network partition converge again instead of staying apart forever (network rule) */
++/** CacheCoin anti-51% barrier: a deeper reorganization is accepted once the candidate branch is
++ *  more than MAX_REORG_DEPTH + this many blocks past the fork point, measured from the branch
++ *  itself, so all nodes release the same branch at the same height and a partition converges
++ *  (network rule) */
+ static const int REORG_HEAL_LEAD_BLOCKS = 30;
+ /** The maximum allowed number of signature check operations in a block (network rule) */
+ static const int64_t MAX_BLOCK_SIGOPS_COST = 80000;
+diff --git a/src/per.cpp b/src/per.cpp
+index 39c1034..cf48a59 100644
+--- a/src/per.cpp
++++ b/src/per.cpp
+@@ -12,6 +12,7 @@
+ #include <node/blockstorage.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
++#include <random.h>
+ #include <script/script.h>
+ #include <validation.h>
+ 
+@@ -364,6 +365,14 @@ bool PerPayoutScriptAllowed(const CScript& payout)
+     if (payout.empty()) return false;
+     if (payout.IsUnspendable()) return false;
+     if (payout.size() > 100) return false;
++    if (!payout.HasValidOps()) return false;
++    // A payout script becomes a mandatory coinbase output one epoch later, and
++    // coinbase outputs count toward the block sigop limit. A 100-byte script of
++    // CHECKSIG/CHECKMULTISIG opcodes would make the payout block exceed
++    // MAX_BLOCK_SIGOPS_COST, so no valid block could ever be mined at that
++    // height and the chain would stall. Honest payout scripts
++    // (P2PKH/P2PK/P2SH/P2WPKH/P2WSH/P2TR) have at most one legacy sigop.
++    if (payout.GetSigOpCount(false) > 1) return false;
+     return true;
+ }
+ 
+@@ -378,11 +387,15 @@ std::optional<PerTicket> PerMineTicket(const uint256& anchor,
+     const arith_uint256 target{
+         TicketTarget(anchor_nbits, params.nPerTicketTargetMultiplier)};
+     if (target == 0) return std::nullopt;
++    // Start at a random nonce: a re-anchor (every 1024 tries) and a repeated call
++    // with an unchanged tip must not recompute the same nonces again. The nonce
++    // is a uint32, so the addition wraps by design.
++    const uint32_t start{FastRandomContext().rand32()};
+     for (uint64_t n = 0; n < max_tries && n <= 0xffffffffu; ++n) {
+         // Respond to shutdown promptly (a default 1M-try run is hours of hashing).
+         // The caller supplies the interrupt flag (ChainstateManager::m_interrupt).
+         if ((n & 1023) == 0 && interrupt && static_cast<bool>(*interrupt)) return std::nullopt;
+-        PerTicket t{anchor, payout, static_cast<uint32_t>(n)};
++        PerTicket t{anchor, payout, static_cast<uint32_t>(start + static_cast<uint32_t>(n))};
+         if (UintToArith256(TicketPowHash(t)) <= target) return t;
+     }
+     return std::nullopt;
+@@ -586,8 +599,7 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+                                const node::BlockManager& blockman,
+                                const Consensus::Params& params,
+                                BlockValidationState& state,
+-                               CAmount& payouts_out,
+-                               bool drop_pool)
++                               CAmount& payouts_out)
+ {
+     payouts_out = 0;
+     if (block.vtx.empty()) {
+@@ -638,11 +650,11 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+         for (int i = 0; i < params.nPerTicketWindow && a; ++i) {
+             auto hist{EmbeddedTicketIds(a, blockman)};
+             if (!hist) {
+-                // Fail closed on a real connect: a replayed ticket must never be
+-                // accepted just because a history block could not be read. A
+-                // template carries no tickets when the history is unreadable
+-                // (PerPoolCollect), so fJustCheck can continue.
+-                if (drop_pool || per.block_tickets > 0) {
++                // Fail closed: a replayed ticket must never be accepted just
++                // because a history block could not be read. A template carries
++                // no tickets when the history is unreadable (PerPoolCollect), so
++                // a ticket-free template can continue.
++                if (per.block_tickets > 0) {
+                     return state.Error("cannot read ticket history");
+                 }
+                 break;
+@@ -757,17 +769,29 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-cb-per-payout", "negative payouts");
+     }
+-    // Confirmed tickets leave the local pool (like confirmed mempool txs), so
+-    // honest miners never re-embed them while the anchor is still in window.
+-    // Skipped for fJustCheck: TestBlockValidity runs on every template built by
+-    // CreateNewBlock, and draining there would empty the pool before mining.
+-    if (drop_pool) {
+-        // Keep this block's ticket ids in memory for the replay window of the
+-        // blocks that follow, so they do not have to read it back from disk.
+-        CacheEmbeddedTicketIds(pindex, ids);
+-        std::lock_guard<std::mutex> lock{g_pool_mutex};
+-        for (const auto& id : ids) g_pool.erase(id);
+-        if (!ids.empty()) ++g_pool_version;
+-    }
+     return true;
+ }
++
++void PerPoolDropEmbedded(const CBlock& block, const PerCommitment& per,
++                         const CBlockIndex* pindex,
++                         const node::BlockManager& blockman)
++{
++    // Only called for a real connect, after every PER, amount and script check
++    // has passed. Dropping tickets inside CheckPerTicketsAndPayouts would let a
++    // rejected block (wrong state, overpaying coinbase) remove tickets this node
++    // still holds and would never embed again.
++    if (!pindex || per.block_tickets == 0 || block.vtx.empty()) return;
++    const CTransaction& cb{*block.vtx[0]};
++    std::vector<uint256> ids;
++    ids.reserve(per.block_tickets);
++    for (size_t i = 2; i < (size_t)2 + per.block_tickets && i < cb.vout.size(); ++i) {
++        auto t{ParseTicketFromScript(cb.vout[i].scriptPubKey)};
++        if (t) ids.push_back(t->Id());
++    }
++    // Keep this block's ticket ids in memory for the replay window of the
++    // blocks that follow, so they do not have to read it back from disk.
++    CacheEmbeddedTicketIds(pindex, ids);
++    std::lock_guard<std::mutex> lock{g_pool_mutex};
++    for (const auto& id : ids) g_pool.erase(id);
++    if (!ids.empty()) ++g_pool_version;
++}
+diff --git a/src/per.h b/src/per.h
+index 7a85682..fdc2dcd 100644
+--- a/src/per.h
++++ b/src/per.h
+@@ -157,7 +157,13 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+                                const node::BlockManager& blockman,
+                                const Consensus::Params& params,
+                                BlockValidationState& state,
+-                               CAmount& payouts_out,
+-                               bool drop_pool = true);
++                               CAmount& payouts_out);
++
++/** Remove a connected block's embedded tickets from the local relay pool. Only
++ *  called after every PER check passed, so a block that is rejected later
++ *  (wrong state, overpaying coinbase) cannot drain the pool. */
++void PerPoolDropEmbedded(const CBlock& block, const PerCommitment& per,
++                         const CBlockIndex* pindex,
++                         const node::BlockManager& blockman);
+ 
+ #endif // BITCOIN_PER_H
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 73c4be2..7a9ae37 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -245,7 +245,14 @@ static RPCHelpMan shunkobroadcast()
+                 for (const CNodeStats& s : stats) connected.push_back(s.addr);
+             }
+             const auto is_connected = [&](const CService& s) {
+-                return std::find(connected.begin(), connected.end(), s) != connected.end();
++                // Compare the network address, not IP:port. An inbound peer's
++                // CNodeStats.addr carries its ephemeral source port, so exact
++                // CService equality would miss that peer's listening address in
++                // addrman and hand the transaction to a connected peer anyway.
++                const CNetAddr& net{static_cast<const CNetAddr&>(s)};
++                return std::any_of(connected.begin(), connected.end(), [&](const CService& c) {
++                    return static_cast<const CNetAddr&>(c) == net;
++                });
+             };
+             const auto add = [&](const CService& s) {
+                 if (s.IsValid() && std::find(candidates.begin(), candidates.end(), s) == candidates.end()) candidates.push_back(s);
+diff --git a/src/shunko.cpp b/src/shunko.cpp
+index 29e4672..bccd7aa 100644
+--- a/src/shunko.cpp
++++ b/src/shunko.cpp
+@@ -104,7 +104,10 @@ std::vector<unsigned char> VersionPayload(int start_height)
+     PutLE<int64_t>(p, 0);                   // time
+     for (int i = 0; i < 2; ++i) p.insert(p.end(), 26, 0); // addr_recv, addr_from (services, IPv6, port)
+     PutLE<uint64_t>(p, FastRandomContext().rand64()); // nonce
+-    const std::string& ua{strSubVersion};
++    // A fixed user agent. strSubVersion carries any -uacomment, which would let a
++    // receiver cluster every hand-over from this node; the one-shot version
++    // message must look like an ordinary node's.
++    static const std::string ua{"/Satoshi:31.1.0/"};
+     p.push_back(static_cast<unsigned char>(std::min<size_t>(ua.size(), 252)));
+     p.insert(p.end(), ua.begin(), ua.begin() + std::min<size_t>(ua.size(), 252));
+     PutLE<int32_t>(p, start_height);
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 3a5fa48..e9a80fc 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2642,14 +2642,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+         return state.Error("failed to read the PER state of the previous block");
+     }
+     CAmount per_payouts{0};
+-    // TestBlockValidity (fJustCheck, run for every template) must not drain
+-    // the ticket pool; only a real connect does.
+-    // The transaction loop breaks instead of returning, so the PER checks would run
+-    // for a block that is about to be rejected. Skip them, or this node drops its own
+-    // tickets for a candidate block it is about to refuse anyway.
++    // This only validates; it never touches the local ticket pool. The pool is
++    // drained by PerPoolDropEmbedded below, after every check has passed, so a
++    // block that is rejected (wrong state, overpaying coinbase, bad scripts)
++    // cannot remove tickets this node still holds.
+     if (state.IsValid() &&
+         !CheckPerTicketsAndPayouts(block, *per, pindex, m_blockman, params.GetConsensus(),
+-                                   state, per_payouts, /*drop_pool=*/!fJustCheck)) {
++                                   state, per_payouts)) {
+         return false;
+     }
+     const PerState per_expected{PerNextState(*prev_per, pindex->nHeight, nFees, per->block_tickets, params.GetConsensus())};
+@@ -2683,6 +2682,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+         return true;
+     }
+ 
++    // Real connect, all checks passed: now the embedded tickets may leave the
++    // local relay pool.
++    PerPoolDropEmbedded(block, *per, pindex, m_blockman);
++
+     CachePerState(pindex, per_expected);
+ 
+     if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
+-- 
+2.53.0.windows.3
+

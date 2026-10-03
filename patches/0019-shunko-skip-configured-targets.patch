@@ -1,0 +1,70 @@
+From cc2c12587ac53628b12f3b98baa994d79bcefe19 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 19/20] shunko: automatic target selection skips configured nodes
+
+The automatic path of shunkobroadcast excludes peers this node is connected
+to, but a configured node that is temporarily down stays in addrman and could
+be picked: the audit's V12 reproduced a -connect target surviving in addrman
+while unreachable. Handing a transaction to the configured VPS would tie the
+one-shot Shunko connection to the node's long-lived identity, which is exactly
+what Shunko exists to avoid.
+
+The automatic path now also skips -connect, -addnode, -seednode and nodes
+added with the addnode RPC, whether or not they are connected. Explicitly
+requested targets are unchanged: naming one of those nodes is the user's
+choice. Addresses are resolved without DNS so the RPC path never blocks on a
+lookup.
+
+SHUNKO_PROTOCOL.md documents the exclusion and keeps the honest limit: an
+inbound onion peer cannot be matched by address and is not excluded.
+---
+ src/rpc/mempool.cpp | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index d4f732e..ea61b3a 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -269,11 +269,38 @@ static RPCHelpMan shunkobroadcast()
+                     add(*s);
+                 }
+             } else {
++                // Configured peers are excluded even while they are down. A -connect
++                // target that is temporarily unreachable stays in addrman (verified
++                // on regtest), and handing the transaction to the home VPS would tie
++                // this one-shot Shunko connection to the node's long-lived identity.
++                // This runs on the automatic path only: explicitly requested targets
++                // are the user's choice and are left alone. Lookup runs without DNS
++                // on purpose: a hostname that only resolves through DNS stays in the
++                // list, but the RPC path must not block a thread on a lookup.
++                std::vector<CNetAddr> configured;
++                const auto remember_configured = [&](const std::string& s) {
++                    if (const auto a{Lookup(s, chainman.GetParams().GetDefaultPort(), /*fAllowLookup=*/false)}) {
++                        configured.push_back(static_cast<const CNetAddr&>(*a));
++                    }
++                };
++                for (const std::string& s : gArgs.GetArgs("-connect")) remember_configured(s);
++                for (const std::string& s : gArgs.GetArgs("-addnode")) remember_configured(s);
++                for (const std::string& s : gArgs.GetArgs("-seednode")) remember_configured(s);
++                if (node.connman) {
++                    for (const AddedNodeInfo& info : node.connman->GetAddedNodeInfo(/*include_connected=*/true)) {
++                        configured.push_back(static_cast<const CNetAddr&>(info.resolvedAddress));
++                    }
++                }
++                const auto is_configured = [&](const CService& s) {
++                    const CNetAddr& net{static_cast<const CNetAddr&>(s)};
++                    return std::any_of(configured.begin(), configured.end(),
++                                       [&](const CNetAddr& c) { return c == net; });
++                };
+                 if (node.addrman) {
+                     for (int i = 0; i < 200 && candidates.size() < 16; ++i) {
+                         const auto [addr, last_try]{node.addrman->Select()};
+                         if (!addr.IsValid()) break;
+-                        if (g_reachable_nets.Contains(addr) && !is_connected(addr)) add(addr);
++                        if (g_reachable_nets.Contains(addr) && !is_connected(addr) && !is_configured(addr)) add(addr);
+                     }
+                 }
+                 std::shuffle(candidates.begin(), candidates.end(), FastRandomContext());
+-- 
+2.43.0
+

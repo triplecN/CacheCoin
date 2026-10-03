@@ -1,0 +1,268 @@
+From 506ffff3f2b9497a79142fd5ab73f6d688fc74f1 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 15/20] shunko: exclude connected peers, rotate targets; warn on a
+ slow clock
+
+rpc/mempool: the addrman candidate path could return this node's own outbound
+peer, and the empty-addrman fallback used outbound peers only. Both defeat the
+one-shot-connection premise; connected peers are now excluded and an empty
+candidate set is an honest error. Auto-selected targets rotate through a
+16-entry recent list so one receiver cannot profile every hand-over. Explicit
+targets are unchanged.
+
+validation: the once-per-refusal log pointer was a function-local static that
+outlived its Chainstate and leaked into the next one; it is a Chainstate member
+now.
+
+node/chainstate: warn when the tip is more than MAX_FUTURE_BLOCK_TIME (10 min)
+but less than TIMESTAMP_WINDOW (2 h) ahead, where start-up passes but consensus
+rejects every new block until the clock is fixed.
+
+fuzz: per_ticket_deserialize feeds raw bytes straight into the ticket
+deserializer and checks the round trip.
+---
+ src/node/chainstate.cpp | 10 +++++++
+ src/rpc/mempool.cpp     | 59 ++++++++++++++++++++++++++++++++---------
+ src/test/fuzz/per.cpp   | 28 +++++++++++++++++++
+ src/validation.cpp      |  9 +++----
+ src/validation.h        |  5 ++++
+ 5 files changed, 93 insertions(+), 18 deletions(-)
+
+diff --git a/src/node/chainstate.cpp b/src/node/chainstate.cpp
+index 477b750..ca0b3b0 100644
+--- a/src/node/chainstate.cpp
++++ b/src/node/chainstate.cpp
+@@ -256,6 +256,16 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
+                                                          "This may be due to your computer's date and time being set incorrectly. "
+                                                          "Only rebuild the block database if you are sure that your computer's date and time are correct")};
+             }
++            // A clock behind by more than MAX_FUTURE_BLOCK_TIME but less than
++            // TIMESTAMP_WINDOW passes the fatal check above, yet consensus rejects
++            // every new block as "time-too-new" until the clock catches up. Warn
++            // now, so a stuck node is not mistaken for a network problem.
++            if (tip && tip->nTime > GetTime() + MAX_FUTURE_BLOCK_TIME) {
++                LogWarning("This node's clock is behind the chain tip by %d seconds. Consensus rejects blocks more than "
++                           "%d seconds in the future, so this node will not follow the chain until its clock is fixed. "
++                           "Enable NTP or correct the system time, then restart.",
++                           tip->nTime - GetTime(), MAX_FUTURE_BLOCK_TIME);
++            }
+ 
+             VerifyDBResult result = CVerifyDB(chainman.GetNotifications()).VerifyDB(
+                 *chainstate, chainman.GetConsensus(), chainstate->CoinsDB(),
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index e04cb28..73c4be2 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -39,8 +39,10 @@
+ #include <validation.h>
+ 
+ #include <algorithm>
++#include <deque>
+ #include <future>
+ #include <map>
++#include <mutex>
+ #include <string_view>
+ #include <utility>
+ 
+@@ -148,6 +150,15 @@ static RPCHelpMan sendrawtransaction()
+     };
+ }
+ 
++namespace {
++// Rotating memory of recently used Shunko targets (auto-selected only). Handing
++// every transaction to the same receiver lets that receiver profile the sender
++// (timing, amounts) even when it cannot link the hand-over to an IP.
++std::mutex g_shunko_recent_mutex;
++std::deque<CService> g_shunko_recent;
++constexpr size_t SHUNKO_RECENT_TARGETS{16};
++} // namespace
++
+ static RPCHelpMan shunkobroadcast()
+ {
+     return RPCHelpMan{"shunkobroadcast",
+@@ -221,11 +232,21 @@ static RPCHelpMan shunkobroadcast()
+             ChainstateManager& chainman = EnsureChainman(node);
+             const bool regtest{chainman.GetParams().GetChainType() == ChainType::REGTEST};
+ 
+-            // Candidate nodes: the given targets, or random known addresses. Outbound peers
+-            // are deliberately NOT preferred: they are a small, stable set tied to this node's
+-            // long-lived connections, so handing to them narrows the anonymity set and risks
+-            // timing correlation. Use addrman diversity; fall back to outbound only if addrman is empty.
++            // Candidate nodes: the given targets, or random known addresses. Peers this
++            // node is already connected to are excluded: the point of Shunko is a one-shot
++            // connection the receiver cannot tie to this node's long-lived ones, and a
++            // connected peer is the easiest node to tie it to. (The old code excluded
++            // nothing on the addrman path and fell back to this node's own outbound peers.)
+             std::vector<CService> candidates;
++            std::vector<CService> connected;
++            if (node.connman) {
++                std::vector<CNodeStats> stats;
++                node.connman->GetNodeStats(stats);
++                for (const CNodeStats& s : stats) connected.push_back(s.addr);
++            }
++            const auto is_connected = [&](const CService& s) {
++                return std::find(connected.begin(), connected.end(), s) != connected.end();
++            };
+             const auto add = [&](const CService& s) {
+                 if (s.IsValid() && std::find(candidates.begin(), candidates.end(), s) == candidates.end()) candidates.push_back(s);
+             };
+@@ -240,14 +261,7 @@ static RPCHelpMan shunkobroadcast()
+                     for (int i = 0; i < 200 && candidates.size() < 16; ++i) {
+                         const auto [addr, last_try]{node.addrman->Select()};
+                         if (!addr.IsValid()) break;
+-                        if (g_reachable_nets.Contains(addr)) add(addr);
+-                    }
+-                }
+-                if (candidates.empty() && node.connman) {
+-                    std::vector<CNodeStats> stats;
+-                    node.connman->GetNodeStats(stats);
+-                    for (const CNodeStats& s : stats) {
+-                        if (!s.fInbound) add(s.addr);
++                        if (g_reachable_nets.Contains(addr) && !is_connected(addr)) add(addr);
+                     }
+                 }
+                 std::shuffle(candidates.begin(), candidates.end(), FastRandomContext());
+@@ -263,13 +277,23 @@ static RPCHelpMan shunkobroadcast()
+                                                 [&](const CService& s) { return !(clearnet_ok && s.IsLocal()) && !ShunkoTargetIsPrivate(s); }),
+                                  candidates.end());
+             }
++            if (request.params[2].isNull()) {
++                // Rotation: prefer targets not used in the last few calls, unless that
++                // would leave nothing (tiny networks); explicit targets are left alone.
++                std::lock_guard<std::mutex> lock{g_shunko_recent_mutex};
++                std::vector<CService> fresh;
++                for (const CService& s : candidates) {
++                    if (std::find(g_shunko_recent.begin(), g_shunko_recent.end(), s) == g_shunko_recent.end()) fresh.push_back(s);
++                }
++                if (!fresh.empty()) candidates = std::move(fresh);
++            }
+             if (candidates.empty()) {
+                 // Keep the "Shunko needs Tor" prefix: mainnet_smoke.py matches on it.
+                 Proxy onion_proxy;
+                 const bool has_proxy{GetProxy(NET_ONION, onion_proxy)};
+                 throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, regtest ? "No known nodes to send the transaction to" :
+                     (!has_proxy ? "Shunko needs Tor: no known node can be reached through a proxy (set proxy=127.0.0.1:9050, see deploy/)"
+-                                : "Shunko needs Tor: proxy is set but no proxy-reachable peer is known yet (addrman empty) - wait for connections and retry"));
++                                : "Shunko needs Tor: proxy is set but no proxy-reachable peer is known yet (addrman empty, or every known peer is already connected) - wait for connections and retry"));
+             }
+ 
+             // Shunko is pointless if the wallet announces or rebroadcasts its own
+@@ -305,10 +329,12 @@ static RPCHelpMan shunkobroadcast()
+             int delivered{0};
+             std::string first_error;
+             size_t next{0};
++            std::vector<CService> used;
+             for (int round = 0; round < 2 && delivered < peers && next < candidates.size(); ++round) {
+                 std::vector<std::future<std::vector<ShunkoDelivery>>> jobs;
+                 for (int i = delivered; i < peers && next < candidates.size(); ++i) {
+                     const CService target{candidates[next++]};
++                    used.push_back(target);
+                     jobs.push_back(std::async(std::launch::async, [&tx, target, &chainman] {
+                         constexpr int SHUNKO_START_HEIGHT{0};
+                         return ShunkoDeliver(*tx, {target}, chainman.GetParams(), SHUNKO_START_HEIGHT, std::chrono::seconds{30});
+@@ -328,6 +354,13 @@ static RPCHelpMan shunkobroadcast()
+                     }
+                 }
+             }
++            if (request.params[2].isNull() && !used.empty()) {
++                std::lock_guard<std::mutex> lock{g_shunko_recent_mutex};
++                for (const CService& s : used) {
++                    g_shunko_recent.push_back(s);
++                    while (g_shunko_recent.size() > SHUNKO_RECENT_TARGETS) g_shunko_recent.pop_front();
++                }
++            }
+             if (delivered == 0) {
+                 throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, "No node could be reached; the transaction was not sent (" + first_error + ")");
+             }
+diff --git a/src/test/fuzz/per.cpp b/src/test/fuzz/per.cpp
+index 52db705..0a5d0ed 100644
+--- a/src/test/fuzz/per.cpp
++++ b/src/test/fuzz/per.cpp
+@@ -47,6 +47,34 @@ FUZZ_TARGET(per_ticket_roundtrip)
+     (void)PerPayoutScriptAllowed(ticket.payout);
+ }
+ 
++FUZZ_TARGET(per_ticket_deserialize)
++{
++    // Raw bytes straight into the ticket deserializer: a block can carry arbitrary
++    // ticket-record bytes, so this path must never crash, over-read, or hand a
++    // half-decoded ticket to consensus.
++    PerTicket ticket;
++    try {
++        SpanReader{buffer} >> ticket;
++    } catch (const std::ios_base::failure&) {
++        return;
++    }
++    const uint256 id{ticket.Id()};
++    DataStream reencoded{};
++    reencoded << ticket;
++    PerTicket decoded;
++    try {
++        reencoded >> decoded;
++    } catch (const std::ios_base::failure&) {
++        assert(false);
++        return;
++    }
++    assert(decoded.anchor == ticket.anchor);
++    assert(decoded.payout == ticket.payout);
++    assert(decoded.nonce == ticket.nonce);
++    assert(decoded.Id() == id);
++    (void)PerPayoutScriptAllowed(ticket.payout);
++}
++
+ FUZZ_TARGET(per_commitment_roundtrip)
+ {
+     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 6df34e7..3a5fa48 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3290,7 +3290,6 @@ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+     do {
+         bool candidates_changed = false;
+         const CBlockIndex* best_refused{nullptr};
+-        static const CBlockIndex* last_logged{nullptr};
+         // Candidates from most to least work. A candidate refused by the re-org barrier is
+         // skipped but stays in setBlockIndexCandidates (every valid block with at least the
+         // tip's work must be in that set), so it is re-evaluated whenever the chain changes.
+@@ -3348,8 +3347,8 @@ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+             }
+             // Report the refusal once per best refused candidate (at most one line per block
+             // mined on the competing branch), and keep the getblockchaininfo warning current.
+-            if (best_refused != nullptr && best_refused != last_logged) {
+-                last_logged = best_refused;
++            if (best_refused != nullptr && best_refused != m_last_reorg_refused_logged) {
++                m_last_reorg_refused_logged = best_refused;
+                 const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
+                 LogInfo("CacheCoin: refused re-org to a branch %d blocks past the fork point at height %d "
+                           "(permitted up to %d, released once past %d). Tip: %d, Candidate: %d %s\n",
+@@ -3363,8 +3362,8 @@ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+         // No usable candidate this pass. When the set did not change we return nullptr, but
+         // must still mirror the once-per-candidate refusal report above; otherwise the
+         // getblockchaininfo warning goes stale when only refused chains remain.
+-        if (best_refused != nullptr && best_refused != last_logged) {
+-            last_logged = best_refused;
++        if (best_refused != nullptr && best_refused != m_last_reorg_refused_logged) {
++            m_last_reorg_refused_logged = best_refused;
+             const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
+             LogInfo("CacheCoin: refused re-org to a branch %d blocks past the fork point at height %d "
+                           "(permitted up to %d, released once past %d). Tip: %d, Candidate: %d %s\n",
+diff --git a/src/validation.h b/src/validation.h
+index e268f47..89ab312 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -892,6 +892,11 @@ protected:
+ 
+     NodeClock::time_point m_next_write{NodeClock::time_point::max()};
+ 
++    /** Best candidate the re-org barrier refused, so its refusal is logged once.
++     *  A member, not a function-local static: a static outlives this Chainstate
++     *  and leaks state (and a pointer to a freed CBlockIndex) into the next one. */
++    const CBlockIndex* GUARDED_BY(::cs_main) m_last_reorg_refused_logged{nullptr};
++
+     /**
+      * In case of an invalid snapshot, rename the coins leveldb directory so
+      * that it can be examined for issue diagnosis.
+-- 
+2.53.0.windows.3
+

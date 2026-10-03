@@ -1,0 +1,225 @@
+From e1b618cb535ce8288150b540e2da787cee54c369 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 12/20] remove development notes and dead code
+
+Drop development comments and dead code: API notes, the duplicate sweep
+comment in the perticket handler, and the dead chainTxData assignment in
+the mainnet parameters. No behaviour changes.
+---
+ CMakeLists.txt             |  4 +---
+ src/chainparams.cpp        |  3 +--
+ src/kernel/chainparams.cpp | 10 ----------
+ src/net_processing.cpp     | 11 -----------
+ src/node/miner.cpp         |  2 --
+ src/per.cpp                | 10 +++-------
+ src/primitives/block.cpp   |  4 ++--
+ src/rpc/mining.cpp         | 10 ++++------
+ src/validation.cpp         | 12 +++++-------
+ 9 files changed, 16 insertions(+), 50 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0c30321..18f4265 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -625,9 +625,7 @@ endif()
+ # consumed here as a prebuilt static library rather than with add_subdirectory():
+ # RandomX's own CMakeLists.txt would additionally create an install() rule and three
+ # executables (randomx-tests, randomx-codegen, randomx-benchmark) that this build does
+-# not want. The `randomx` target defined below replaces the three autotools hunks of
+-# patches/0003-randomx-proof-of-work.patch: the -I for randomx/src, the
+-# crypto/randomx_wrapper.{h,cpp} sources, and the librandomx.a on the link line.
++# not want.
+ option(CACHECOIN_RANDOMX "Build CacheCoin's RandomX proof of work. ON consumes the pinned RandomX checkout under src/crypto/randomx; OFF expects a system-installed RandomX." ON)
+ set(CACHECOIN_RANDOMX_ROOT "${PROJECT_SOURCE_DIR}/src/crypto/randomx" CACHE PATH "Root of the pinned RandomX checkout (provides src/randomx.h and build/librandomx.a).")
+ if(CACHECOIN_RANDOMX)
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 580b3e2..257c751 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -141,8 +141,7 @@ void SelectParams(const ChainType chain)
+ {
+     // CacheCoin defines no public test network. The testnet, testnet4 and signet
+     // parameters are still Bitcoin's (their genesis blocks fail RandomX), so refuse
+-    // to run them. ChainType::TESTNET4 is listed
+-    // explicitly because upstream v31.1 added it.
++    // to run them, including -testnet4.
+     if (chain == ChainType::TESTNET || chain == ChainType::TESTNET4 || chain == ChainType::SIGNET) {
+         throw std::runtime_error("CacheCoin has no public test network: -testnet, -testnet4 and -signet are disabled. Use -regtest for local testing.");
+     }
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 67608ef..a60e2a4 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -193,16 +193,6 @@ public:
+         fDefaultConsistencyChecks = false;
+         m_is_mockable_chain = false;
+ 
+-        // Genesis checkpoint:
+-        // Height 0: CacheCoin Genesis Block
+-
+-        chainTxData = ChainTxData{
+-            // Data from RPC: getchaintxstats 4096 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+-            .nTime    = 1772055173,
+-            .tx_count = 1315805869,
+-            .dTxRate  = 5.40111006496122,
+-        };
+-
+         // No history yet (Bitcoin's figures would make verificationprogress report ~0%).
+         chainTxData = ChainTxData{
+             .nTime    = 0,
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 4587ba1..a376c97 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -2294,8 +2294,6 @@ void PeerManagerImpl::RelayPerTicket(const PerTicket& ticket)
+ {
+     m_connman.ForEachNode([this, &ticket](CNode* pnode) {
+         if (pnode->fSuccessfullyConnected) {
+-            // v31.1 port: CNetMsgMaker is gone; MakeAndPushMessage wraps NetMsg::Make,
+-            // which handles the node's negotiated version itself.
+             MakeAndPushMessage(*pnode, NetMsgType::PERTICKET, ticket);
+         }
+     });
+@@ -4627,12 +4625,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+         // CacheCoin: check a new header's RandomX proof of work here, outside cs_main
+         // (ProcessNewBlockHeaders would hash it while holding cs_main). A pass is cached.
+         if (received_new_header) {
+-            // v31.1: HasValidProofOfWork takes std::span<const CBlockHeader>, so a
+-            // braced-init-list no longer converts; an explicit array is required.
+             const std::array<CBlockHeader, 1> cmpctblock_headers{cmpctblock.header};
+             if (!HasValidProofOfWork(cmpctblock_headers, m_chainparams.GetConsensus())) {
+-                // v31.1: Misbehaving() lost its 'howmuch' argument, and 'peer' is
+-                // already a reference in this scope.
+                 Misbehaving(peer, "invalid header via cmpctblock");
+                 return;
+             }
+@@ -4965,8 +4959,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+                 LogDebug(BCLog::NET, "Ignoring low-work unrequested block %s from peer=%d\n", hash.ToString(), pfrom.GetId());
+                 return;
+             }
+-            // v31.1 port: CBlock now derives from CBlockHeader (no GetBlockHeader()), and
+-            // HasValidProofOfWork takes a span of headers.
+             const CBlockHeader header{*pblock};
+             if (!HasValidProofOfWork(std::span<const CBlockHeader>{&header, 1}, m_chainparams.GetConsensus())) {
+                 Misbehaving(peer, "block with invalid proof of work");
+@@ -5036,9 +5028,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+             }
+             peer.m_per_ticket_tokens -= 1.0;
+             if (PerPoolSize() >= 10000) {
+-                // Relay-only nodes never template or mine, so nothing else
+-                // sweeps for them: one sweep before dropping, or stale tickets
+-                // wedge the pool forever.
+                 // Relay-only nodes never template or mine, so nothing else sweeps for
+                 // them and stale tickets would wedge the pool for good. Sweeping copies
+                 // the whole pool and does a block index lookup per entry under cs_main,
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index e2edaa1..43e6934 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -172,8 +172,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
+     // m_options.block_reserved_weight only covers the header, the tx count and the coinbase's
+     // own dummy output, so these extra coinbase outputs have to be charged to the budget here,
+     // before addChunks() fills the rest of the block.
+-    // GetSerializeSize() no longer takes a protocol version; the one-argument
+-    // form is the plain non-witness size.
+     size_t per_extra_bytes = ::GetSerializeSize(PerCommitmentOutput(PerCommitment{}));
+     for (const auto& o : per_extra_outs) per_extra_bytes += ::GetSerializeSize(o);
+     nBlockWeight += per_extra_bytes * WITNESS_SCALE_FACTOR;
+diff --git a/src/per.cpp b/src/per.cpp
+index e653d96..8948446 100644
+--- a/src/per.cpp
++++ b/src/per.cpp
+@@ -237,11 +237,8 @@ bool PerTicketPowValid(const PerTicket& ticket, uint32_t anchor_nbits,
+ 
+ uint256 PerTicket::Id() const
+ {
+-    // v31.1 port: CHashWriter was removed upstream. Its CHashWriter::operator<< did
+-    // exactly `::Serialize(*this, obj)` on the HashWriter base and never emitted the
+-    // nVersion it stored, so HashWriter (the surviving base class, same double-SHA256
+-    // GetHash()) produces a byte-for-byte identical digest and therefore identical
+-    // ticket ids. Keep this stable: PerTicket ids are consensus-relevant.
++    // Ticket ids are consensus-relevant: this is the double-SHA256 of the serialized
++    // ticket (anchor, payout, nonce). Keep it stable.
+     HashWriter ss;
+     ss << *this;
+     return ss.GetHash();
+@@ -378,8 +375,7 @@ std::optional<PerTicket> PerMineTicket(const uint256& anchor,
+     if (target == 0) return std::nullopt;
+     for (uint64_t n = 0; n < max_tries && n <= 0xffffffffu; ++n) {
+         // Respond to shutdown promptly (a default 1M-try run is hours of hashing).
+-        // v31.1 port: the global ShutdownRequested() is gone; the caller supplies the
+-        // interrupt flag (ChainstateManager::m_interrupt).
++        // The caller supplies the interrupt flag (ChainstateManager::m_interrupt).
+         if ((n & 1023) == 0 && interrupt && static_cast<bool>(*interrupt)) return std::nullopt;
+         PerTicket t{anchor, payout, static_cast<uint32_t>(n)};
+         if (UintToArith256(TicketPowHash(t)) <= target) return t;
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index 0e2c371..a8c4602 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -39,8 +39,8 @@ std::string CBlock::ToString() const
+ 
+ uint256 CBlockHeader::GetPoWHash() const
+ {
+-    // CacheCoin: CDataStream is gone in v31.x, but the consensus input is unchanged: the
+-    // 80-byte serialization of the header, hashed with RandomX v1.
++    // The consensus input is the 80-byte serialization of the header, hashed with
++    // RandomX v1.
+     DataStream ss{};
+     ss << *this;
+     assert(ss.size() == 80);
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index a0f24b0..8d79c4d 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1006,11 +1006,10 @@ static RPCHelpMan getblocktemplate()
+     result.pushKV("transactions", std::move(transactions));
+     result.pushKV("coinbaseaux", std::move(aux));
+     result.pushKV("coinbasevalue", block.vtx[0]->vout[0].nValue);
+-    // CacheCoin PER: vTxFees is per-transaction in v31.1 (the coinbase is not in it), so the
+-    // block's total fees are their sum. getTxFees() returns BY VALUE, so it must be
+-    // bound to one local: calling it twice would take begin() and end() from two
+-    // different temporaries (and with a non-empty mempool that segfaults). The
+-    // per-transaction vector is the only source.
++    // CacheCoin PER: vTxFees is per-transaction (the coinbase is not in it), so the block's
++    // total fees are their sum. getTxFees() returns BY VALUE, so it must be bound to one
++    // local: calling it twice would take begin() and end() from two different temporaries
++    // (and with a non-empty mempool that segfaults).
+     const std::vector<CAmount> per_tx_fees{block_template->getTxFees()};
+     const CAmount total_fees{std::accumulate(per_tx_fees.begin(), per_tx_fees.end(), CAmount{0})};
+     result.pushKV("coinbasefee", (int64_t)(total_fees - PerFeeShare(total_fees)));
+@@ -1282,7 +1281,6 @@ static RPCHelpMan generateperticket()
+             anchor = tip->GetBlockHash();
+             anchor_nbits = tip->nBits;
+         }
+-        // v31.1 port: chainman.m_interrupt replaces the removed global ShutdownRequested().
+         const uint64_t slice{std::min(remaining, PER_ANCHOR_SLICE)};
+         ticket = PerMineTicket(anchor, anchor_nbits, payout, slice, consensus, &chainman.m_interrupt);
+         remaining -= slice;
+diff --git a/src/validation.cpp b/src/validation.cpp
+index b1c0c1e..6df34e7 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2644,14 +2644,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+     CAmount per_payouts{0};
+     // TestBlockValidity (fJustCheck, run for every template) must not drain
+     // the ticket pool; only a real connect does.
+-// When the transactions are already invalid this function used to return
+-// before the reservoir side effect below, so it was unreachable for such a
+-// block. Upstream now breaks out of the loop instead, so the PER checks run
+-// for a block that will be rejected. Skip them, or this node would drop its
+-// own tickets for a candidate block it is about to refuse anyway.
+-if (state.IsValid() &&
++    // The transaction loop breaks instead of returning, so the PER checks would run
++    // for a block that is about to be rejected. Skip them, or this node drops its own
++    // tickets for a candidate block it is about to refuse anyway.
++    if (state.IsValid() &&
+         !CheckPerTicketsAndPayouts(block, *per, pindex, m_blockman, params.GetConsensus(),
+-                               state, per_payouts, /*drop_pool=*/!fJustCheck)) {
++                                   state, per_payouts, /*drop_pool=*/!fJustCheck)) {
+         return false;
+     }
+     const PerState per_expected{PerNextState(*prev_per, pindex->nHeight, nFees, per->block_tickets, params.GetConsensus())};
+-- 
+2.53.0.windows.3
+

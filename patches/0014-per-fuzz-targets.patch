@@ -1,0 +1,163 @@
+From 72e1973910c3d12da6e8f4fb2ec522fec1663ba3 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 14/20] add fuzz targets for the PER code
+
+per_ticket_roundtrip, per_commitment_roundtrip, per_parse_commitment and
+per_next_state exercise the ticket serialization and id, the commitment
+parser, the payout-script bound and the reservoir state transition with
+arbitrary inputs. The fuzz binary links bitcoin_node so per.cpp is
+available; the targets are not part of the default build
+(BUILD_FUZZ_BINARY=OFF), so the shipped binaries are unchanged.
+---
+ src/test/fuzz/CMakeLists.txt |   1 +
+ src/test/fuzz/per.cpp        | 126 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+)
+ create mode 100644 src/test/fuzz/per.cpp
+
+diff --git a/src/test/fuzz/CMakeLists.txt b/src/test/fuzz/CMakeLists.txt
+index fc82fdc..fdf7c21 100644
+--- a/src/test/fuzz/CMakeLists.txt
++++ b/src/test/fuzz/CMakeLists.txt
+@@ -86,6 +86,7 @@ add_executable(fuzz
+   parse_script.cpp
+   parse_univalue.cpp
+   partially_downloaded_block.cpp
++  per.cpp
+   policy_estimator.cpp
+   policy_estimator_io.cpp
+   poolresource.cpp
+diff --git a/src/test/fuzz/per.cpp b/src/test/fuzz/per.cpp
+new file mode 100644
+index 0000000..52db705
+--- /dev/null
++++ b/src/test/fuzz/per.cpp
+@@ -0,0 +1,126 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <consensus/amount.h>
++#include <consensus/params.h>
++#include <per.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <streams.h>
++#include <test/fuzz/FuzzedDataProvider.h>
++#include <test/fuzz/fuzz.h>
++#include <test/fuzz/util.h>
++#include <uint256.h>
++
++#include <cassert>
++#include <cstdint>
++#include <vector>
++
++FUZZ_TARGET(per_ticket_roundtrip)
++{
++    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
++    PerTicket ticket;
++    ticket.anchor = ConsumeUInt256(fuzzed_data_provider);
++    const std::vector<uint8_t> payout_bytes{
++        fuzzed_data_provider.ConsumeBytes<uint8_t>(
++            fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, 200))};
++    ticket.payout = CScript(payout_bytes.begin(), payout_bytes.end());
++    ticket.nonce = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
++
++    // The ticket id is consensus-relevant: it must be a pure function of the
++    // content and survive a serialization round trip.
++    const uint256 id{ticket.Id()};
++    assert(ticket.Id() == id);
++
++    DataStream stream{};
++    stream << ticket;
++    PerTicket decoded;
++    stream >> decoded;
++    assert(decoded.anchor == ticket.anchor);
++    assert(decoded.payout == ticket.payout);
++    assert(decoded.nonce == ticket.nonce);
++    assert(decoded.Id() == id);
++
++    const CTxOut out{PerTicketOutput(ticket)};
++    assert(out.nValue == 0);
++    (void)PerPayoutScriptAllowed(ticket.payout);
++}
++
++FUZZ_TARGET(per_commitment_roundtrip)
++{
++    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
++    PerCommitment commitment;
++    commitment.state.pool = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY);
++    commitment.state.tickets = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
++    commitment.state.rate = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY);
++    commitment.block_tickets = fuzzed_data_provider.ConsumeIntegral<uint16_t>();
++    commitment.payouts = fuzzed_data_provider.ConsumeIntegral<uint16_t>();
++
++    CMutableTransaction tx;
++    tx.vout.push_back(PerCommitmentOutput(commitment));
++    const CTransaction ctx{tx};
++    size_t index{0};
++    const auto parsed{ParsePerCommitment(ctx, &index)};
++    assert(parsed.has_value());
++    assert(index == 0);
++    assert(parsed->state.pool == commitment.state.pool);
++    assert(parsed->state.tickets == commitment.state.tickets);
++    assert(parsed->state.rate == commitment.state.rate);
++    assert(parsed->block_tickets == commitment.block_tickets);
++    assert(parsed->payouts == commitment.payouts);
++}
++
++FUZZ_TARGET(per_parse_commitment)
++{
++    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
++    CMutableTransaction tx;
++    LIMITED_WHILE(fuzzed_data_provider.remaining_bytes() > 0, 8)
++    {
++        CTxOut out;
++        out.nValue = fuzzed_data_provider.ConsumeIntegral<CAmount>();
++        const std::vector<uint8_t> bytes{fuzzed_data_provider.ConsumeBytes<uint8_t>(
++            fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, 64))};
++        out.scriptPubKey = CScript(bytes.begin(), bytes.end());
++        tx.vout.push_back(out);
++    }
++    const CTransaction ctx{tx};
++    size_t index{0};
++    (void)ParsePerCommitment(ctx, &index);
++    for (const auto& out : tx.vout) {
++        (void)PerPayoutScriptAllowed(out.scriptPubKey);
++    }
++}
++
++FUZZ_TARGET(per_next_state)
++{
++    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
++    PerState previous;
++    previous.pool = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY);
++    previous.tickets = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
++    previous.rate = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY);
++
++    Consensus::Params params{};
++    params.nPerEpochBlocks = fuzzed_data_provider.ConsumeIntegralInRange<int>(1, 100'000);
++    const int height{fuzzed_data_provider.ConsumeIntegralInRange<int>(0, 10'000'000)};
++    const CAmount fees{fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY)};
++    const uint32_t tickets{fuzzed_data_provider.ConsumeIntegral<uint32_t>()};
++
++    const PerState next{PerNextState(previous, height, fees, tickets, params)};
++    assert(next.pool >= 0);
++    assert(next.rate >= 0);
++    assert(PerEpoch(height, params) >= 0);
++
++    const bool boundary{params.nPerEpochBlocks > 0 && height > 1 &&
++                        ((height - 1) % params.nPerEpochBlocks) == 0};
++    if (boundary) {
++        const CAmount rate{previous.tickets ? previous.pool / static_cast<CAmount>(previous.tickets) : 0};
++        assert(next.rate == rate);
++        assert(next.pool == previous.pool - rate * static_cast<CAmount>(previous.tickets) + PerFeeShare(fees));
++        assert(next.tickets == tickets);
++    } else {
++        assert(next.rate == previous.rate);
++        assert(next.pool == previous.pool + PerFeeShare(fees));
++        assert(next.tickets == previous.tickets + tickets);
++    }
++}
+-- 
+2.53.0.windows.3
+

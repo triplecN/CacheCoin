@@ -1,0 +1,615 @@
+From eed7369d5e6f94bd4a184f1f894e04ac52919547 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 06/20] network hardening, timestamp rules,
+ Shunko relay
+
+Larger block-download timeouts for Tor, a 10-minute future-block limit, and
+the Shunko one-shot transaction hand-over (shunkobroadcast).
+---
+ src/CMakeLists.txt      |   1 +
+ src/chain.h             |  14 ++-
+ src/net_processing.cpp  |   9 +-
+ src/node/chainstate.cpp |   5 +-
+ src/rpc/client.cpp      |   3 +
+ src/rpc/mempool.cpp     | 196 ++++++++++++++++++++++++++++++++++++++++
+ src/shunko.cpp          | 195 +++++++++++++++++++++++++++++++++++++++
+ src/shunko.h            |  45 +++++++++
+ 8 files changed, 461 insertions(+), 7 deletions(-)
+ create mode 100644 src/shunko.cpp
+ create mode 100644 src/shunko.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ad18115..a99d335 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -260,6 +260,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
+   rpc/signmessage.cpp
+   rpc/txoutproof.cpp
+   script/sigcache.cpp
++  shunko.cpp
+   signet.cpp
+   torcontrol.cpp
+   txdb.cpp
+diff --git a/src/chain.h b/src/chain.h
+index c278292..91be993 100644
+--- a/src/chain.h
++++ b/src/chain.h
+@@ -25,16 +25,26 @@
+ /**
+  * Maximum amount of time that a block timestamp is allowed to exceed the
+  * current time before the block will be accepted.
++ *
++ * CacheCoin: 10 minutes (10 x the 60 s target spacing). Bitcoin's 2 hours is 120
++ * target spacings here, which lets a dominant miner stamp about 20 blocks at LWMA's
++ * +6T solve-time clamp and cut the difficulty about 4x. At 10 minutes the timestamps
++ * can run ahead by at most two such blocks, while node clocks may still differ by
++ * several minutes.
+  */
+-static constexpr int64_t MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60;
++static constexpr int64_t MAX_FUTURE_BLOCK_TIME = 10 * 60;
+ 
+ /**
+  * Timestamp window used as a grace period by code that compares external
+  * timestamps (such as timestamps passed to RPCs, or wallet key creation times)
+  * to block timestamps. This should be set at least as high as
+  * MAX_FUTURE_BLOCK_TIME.
++ *
++ * CacheCoin: kept at Bitcoin's 2 hours (a wider grace period for wallet rescans
++ * only), independent of the smaller MAX_FUTURE_BLOCK_TIME.
+  */
+-static constexpr int64_t TIMESTAMP_WINDOW = MAX_FUTURE_BLOCK_TIME;
++static constexpr int64_t TIMESTAMP_WINDOW = 2 * 60 * 60;
++static_assert(TIMESTAMP_WINDOW >= MAX_FUTURE_BLOCK_TIME);
+ //! Init values for CBlockIndex nSequenceId when loaded from disk
+ static constexpr int32_t SEQ_ID_BEST_CHAIN_FROM_DISK = 0;
+ static constexpr int32_t SEQ_ID_INIT_FROM_DISK = 1;
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 367b579..ea6c8b8 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -146,10 +146,11 @@ static_assert(MAX_BLOCKTXN_DEPTH <= MIN_BLOCKS_TO_KEEP, "MAX_BLOCKTXN_DEPTH too
+  *  degree of disordering of blocks on disk (which make reindexing and pruning harder). We'll probably
+  *  want to make this a per-peer adaptive value at some point. */
+ static const unsigned int BLOCK_DOWNLOAD_WINDOW = 1024;
+-/** Block download timeout base, expressed in multiples of the block interval (i.e. 10 min) */
+-static constexpr double BLOCK_DOWNLOAD_TIMEOUT_BASE = 1;
+-/** Additional block download timeout per parallel downloading peer (i.e. 5 min) */
+-static constexpr double BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 0.5;
++/** Block download timeout base, expressed in multiples of the block interval
++ *  (CacheCoin: 5 x 60 s = 5 min, so a 2 MB block can arrive over a slow Tor circuit) */
++static constexpr double BLOCK_DOWNLOAD_TIMEOUT_BASE = 5;
++/** Additional block download timeout per parallel downloading peer (CacheCoin: 2.5 min) */
++static constexpr double BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 2.5;
+ /** Maximum number of headers to announce when relaying blocks with headers message.*/
+ static const unsigned int MAX_BLOCKS_TO_ANNOUNCE = 8;
+ /** Minimum blocks required to signal NODE_NETWORK_LIMITED */
+diff --git a/src/node/chainstate.cpp b/src/node/chainstate.cpp
+index ff3de29..477b750 100644
+--- a/src/node/chainstate.cpp
++++ b/src/node/chainstate.cpp
+@@ -248,7 +248,10 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
+     for (auto& chainstate : chainman.m_chainstates) {
+         if (!is_coinsview_empty(*chainstate)) {
+             const CBlockIndex* tip = chainstate->m_chain.Tip();
+-            if (tip && tip->nTime > GetTime() + MAX_FUTURE_BLOCK_TIME) {
++            // CacheCoin: this start-up sanity check keeps Bitcoin's 2-hour margin (TIMESTAMP_WINDOW):
++            // with the 10-minute MAX_FUTURE_BLOCK_TIME a clock that is a few minutes slow at boot
++            // would otherwise stop the node.
++            if (tip && tip->nTime > GetTime() + TIMESTAMP_WINDOW) {
+                 return {ChainstateLoadStatus::FAILURE, _("The block database contains a block which appears to be from the future. "
+                                                          "This may be due to your computer's date and time being set incorrectly. "
+                                                          "Only rebuild the block database if you are sure that your computer's date and time are correct")};
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 8422af1..32da956 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -165,6 +165,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
+     { "signrawtransactionwithwallet", 1, "prevtxs" },
+     { "sendrawtransaction", 1, "maxfeerate" },
+     { "sendrawtransaction", 2, "maxburnamount" },
++    { "shunkobroadcast", 1, "peers" },
++    { "shunkobroadcast", 2, "targets" },
++    { "shunkobroadcast", 3, "maxfeerate" },
+     { "testmempoolaccept", 0, "rawtxs" },
+     { "testmempoolaccept", 1, "maxfeerate" },
+     { "submitpackage", 0, "package" },
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index c480b5a..ad32642 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -7,30 +7,39 @@
+ 
+ #include <node/mempool_persist.h>
+ 
++#include <addrman.h>
+ #include <chainparams.h>
+ #include <common/args.h>
+ #include <consensus/validation.h>
+ #include <core_io.h>
+ #include <index/txospenderindex.h>
+ #include <kernel/mempool_entry.h>
++#include <net.h>
+ #include <net_processing.h>
+ #include <netbase.h>
++#include <node/context.h>
+ #include <node/mempool_persist_args.h>
+ #include <node/types.h>
+ #include <policy/rbf.h>
+ #include <policy/settings.h>
+ #include <primitives/transaction.h>
++#include <random.h>
+ #include <rpc/server.h>
+ #include <rpc/server_util.h>
+ #include <rpc/util.h>
++#include <shunko.h>
+ #include <txmempool.h>
+ #include <univalue.h>
++#include <util/chaintype.h>
+ #include <util/fs.h>
+ #include <util/moneystr.h>
+ #include <util/strencodings.h>
+ #include <util/time.h>
+ #include <util/vector.h>
++#include <validation.h>
+ 
++#include <algorithm>
++#include <future>
+ #include <map>
+ #include <string_view>
+ #include <utility>
+@@ -139,6 +148,192 @@ static RPCHelpMan sendrawtransaction()
+     };
+ }
+ 
++static RPCHelpMan shunkobroadcast()
++{
++    return RPCHelpMan{"shunkobroadcast",
++        "Shunko Protocol: send a signed raw transaction without this node ever announcing it.\n"
++        "The transaction is checked against the mempool rules but NOT added to this node's mempool.\n"
++        "It is handed to a few other nodes over one-shot P2P v1 connections (BIP324 v2 is used for regular peering, not for these hand-overs), each through its own fresh\n"
++        "Tor circuit, and those nodes relay it as usual. The transaction and the public ledger stay\n"
++        "ordinary and auditable; only the link between the transaction and this node (and its IP\n"
++        "address) is hidden. Outside regtest every connection must go through a proxy (Tor).\n"
++        "A call can hold its RPC thread up to about a minute (two rounds of 30 s hand-overs);\n"
++        "do not run more of them concurrently than you have RPC threads.\n"
++        "\"Delivered\" means a peer processed the hand-over connection, not a mempool\n"
++        "acceptance: a peer can still drop the transaction under its own policy, and it\n"
++        "will then never confirm (see scripts/sendtoshunko.sh).\n"
++        "Set walletbroadcast=0 (see deploy/home/cachecoin.conf) and build the transaction\n"
++        "with add_to_wallet=false, otherwise the wallet may announce or rebroadcast it and\n"
++        "reveal this node as its origin. Use a new receiving address for every payment, or the ledger itself links your payments.\n",
++        {
++            {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The hex string of the signed raw transaction"},
++            {"peers", RPCArg::Type::NUM, RPCArg::Default{2}, "How many nodes should receive it (1-8)"},
++            {"targets", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "Nodes to use instead of random known addresses",
++                {
++                    {"address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "host:port, for example an .onion address"},
++                },
++            },
++            {"maxfeerate", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
++             "Reject transactions whose fee rate is higher than the specified value, expressed in " + CURRENCY_UNIT +
++                 "/kvB.\nSet to 0 to accept any fee rate."},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ, "", "",
++            {
++                {RPCResult::Type::STR_HEX, "txid", "The transaction id"},
++                {RPCResult::Type::NUM, "delivered", "How many hand-overs completed (a peer processed the connection; not a mempool acceptance)"},
++                {RPCResult::Type::ARR, "attempts", "One entry per node tried",
++                    {
++                        {RPCResult::Type::OBJ, "", "",
++                            {
++                                {RPCResult::Type::STR, "target", "host:port"},
++                                {RPCResult::Type::BOOL, "delivered", "Whether the hand-over to the node completed"},
++                                {RPCResult::Type::STR, "error", /*optional=*/true, "Why the delivery failed"},
++                            }},
++                    }},
++            }},
++        RPCExamples{
++            "\nCreate and sign a transaction without broadcasting it, then send it through Shunko\n"
++            + HelpExampleCli("-named send", "outputs='{\"cccn1q...\": 1.5}' add_to_wallet=false lock_unspents=true") +
++            HelpExampleCli("shunkobroadcast", "\"signedhex\"") +
++            HelpExampleRpc("shunkobroadcast", "\"signedhex\"")
++        },
++        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++        {
++            CMutableTransaction mtx;
++            if (!DecodeHexTx(mtx, request.params[0].get_str())) {
++                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.");
++            }
++            for (const auto& out : mtx.vout) {
++                if ((out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps()) && out.nValue > 0) {
++                    throw JSONRPCTransactionError(TransactionError::MAX_BURN_EXCEEDED);
++                }
++            }
++            const CTransactionRef tx{MakeTransactionRef(std::move(mtx))};
++            const int peers{request.params[1].isNull() ? 2 : request.params[1].getInt<int>()};
++            if (peers < 1 || peers > 8) throw JSONRPCError(RPC_INVALID_PARAMETER, "peers must be between 1 and 8");
++            // The delivery loop serves at most `peers` targets; more are unreachable
++            // dead weight that only spawns joined threads, so cap the array too.
++            if (!request.params[2].isNull() && request.params[2].get_array().size() > 8) throw JSONRPCError(RPC_INVALID_PARAMETER, "at most 8 targets per call");
++            const CFeeRate max_raw_tx_fee_rate{request.params[3].isNull() ? DEFAULT_MAX_RAW_TX_FEE_RATE : CFeeRate(AmountFromValue(request.params[3]))};
++
++            NodeContext& node = EnsureAnyNodeContext(request.context);
++            ChainstateManager& chainman = EnsureChainman(node);
++            const bool regtest{chainman.GetParams().GetChainType() == ChainType::REGTEST};
++
++            // Candidate nodes: the given targets, or random known addresses. Outbound peers
++            // are deliberately NOT preferred: they are a small, stable set tied to this node's
++            // long-lived connections, so handing to them narrows the anonymity set and risks
++            // timing correlation. Use addrman diversity; fall back to outbound only if addrman is empty.
++            std::vector<CService> candidates;
++            const auto add = [&](const CService& s) {
++                if (s.IsValid() && std::find(candidates.begin(), candidates.end(), s) == candidates.end()) candidates.push_back(s);
++            };
++            if (!request.params[2].isNull()) {
++                for (const UniValue& t : request.params[2].get_array().getValues()) {
++                    const std::optional<CService> s{Lookup(t.get_str(), chainman.GetParams().GetDefaultPort(), /*fAllowLookup=*/false)};
++                    if (!s) throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid target: " + t.get_str());
++                    add(*s);
++                }
++            } else {
++                if (node.addrman) {
++                    for (int i = 0; i < 200 && candidates.size() < 16; ++i) {
++                        const auto [addr, last_try]{node.addrman->Select()};
++                        if (!addr.IsValid()) break;
++                        if (g_reachable_nets.Contains(addr)) add(addr);
++                    }
++                }
++                if (candidates.empty() && node.connman) {
++                    std::vector<CNodeStats> stats;
++                    node.connman->GetNodeStats(stats);
++                    for (const CNodeStats& s : stats) {
++                        if (!s.fInbound) add(s.addr);
++                    }
++                }
++                std::shuffle(candidates.begin(), candidates.end(), FastRandomContext());
++            }
++            if (!regtest) {
++                // Without a proxy the receiving node would see this node's IP address.
++                candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [](const CService& s) { return !ShunkoTargetIsPrivate(s); }),
++                                 candidates.end());
++            }
++            if (candidates.empty()) {
++                // Keep the "Shunko needs Tor" prefix: mainnet_smoke.py matches on it.
++                Proxy onion_proxy;
++                const bool has_proxy{GetProxy(NET_ONION, onion_proxy)};
++                throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, regtest ? "No known nodes to send the transaction to" :
++                    (!has_proxy ? "Shunko needs Tor: no known node can be reached through a proxy (set proxy=127.0.0.1:9050, see deploy/)"
++                                : "Shunko needs Tor: proxy is set but no proxy-reachable peer is known yet (addrman empty) - wait for connections and retry"));
++            }
++
++            // Shunko is pointless if the wallet announces or rebroadcasts its own
++            // transactions: that would mark this node as the origin regardless of the
++            // one-shot hand-over. Refuse unless walletbroadcast=0 (no consensus change,
++            // transport-layer guard only). Checked after the Tor refusal above so the
++            // "needs Tor" error keeps firing first when no proxy peer exists.
++            // Exempt regtest so tests/shunko_regtest.py keeps passing without extra config.
++            if (!regtest && gArgs.GetBoolArg("-walletbroadcast", true)) {
++                throw JSONRPCError(RPC_INVALID_PARAMETER, "Shunko needs walletbroadcast=0 (see deploy/home/cachecoin.conf): otherwise the wallet may announce or rebroadcast the transaction and reveal this node as its origin. Set walletbroadcast=0 and build the transaction with add_to_wallet=false.");
++            }
++
++            // Check it would be accepted, without adding it to this node's mempool.
++            // Privacy: the one-shot version handshake always claims start_height 0.
++            // Sending the real tip height would leak exactly how synced this node is,
++            // so ActiveHeight() is deliberately never read here. tests/shunko_regtest.py
++            // asserts no height value, so it keeps passing with 0.
++            {
++                LOCK(cs_main);
++                const MempoolAcceptResult result{chainman.ProcessTransaction(tx, /*test_accept=*/true)};
++                if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
++                    throw JSONRPCError(RPC_VERIFY_REJECTED, result.m_state.ToString());
++                }
++                const CAmount max_raw_tx_fee{max_raw_tx_fee_rate.GetFee(GetVirtualTransactionSize(*tx))};
++                if (max_raw_tx_fee && result.m_base_fees.value() > max_raw_tx_fee) {
++                    throw JSONRPCTransactionError(TransactionError::MAX_FEE_EXCEEDED);
++                }
++            }
++
++            // At most two rounds, each trying up to `peers` nodes at the same time with a 30 s
++            // limit, so a call never holds an RPC thread for more than about a minute.
++            UniValue attempts(UniValue::VARR);
++            int delivered{0};
++            std::string first_error;
++            size_t next{0};
++            for (int round = 0; round < 2 && delivered < peers && next < candidates.size(); ++round) {
++                std::vector<std::future<std::vector<ShunkoDelivery>>> jobs;
++                for (int i = delivered; i < peers && next < candidates.size(); ++i) {
++                    const CService target{candidates[next++]};
++                    jobs.push_back(std::async(std::launch::async, [&tx, target, &chainman] {
++                        constexpr int SHUNKO_START_HEIGHT{0};
++                        return ShunkoDeliver(*tx, {target}, chainman.GetParams(), SHUNKO_START_HEIGHT, std::chrono::seconds{30});
++                    }));
++                }
++                for (auto& job : jobs) {
++                    for (const ShunkoDelivery& r : job.get()) {
++                        UniValue a(UniValue::VOBJ);
++                        a.pushKV("target", r.target);
++                        a.pushKV("delivered", r.delivered);
++                        if (!r.delivered) {
++                            a.pushKV("error", r.error);
++                            if (first_error.empty()) first_error = r.error;
++                        }
++                        attempts.push_back(a);
++                        if (r.delivered) ++delivered;
++                    }
++                }
++            }
++            if (delivered == 0) {
++                throw JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, "No node could be reached; the transaction was not sent (" + first_error + ")");
++            }
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("txid", tx->GetHash().GetHex());
++            ret.pushKV("delivered", delivered);
++            ret.pushKV("attempts", attempts);
++            return ret;
++        },
++    };
++}
++
+ static RPCHelpMan getprivatebroadcastinfo()
+ {
+     return RPCHelpMan{
+@@ -1507,6 +1702,7 @@ void RegisterMempoolRPCCommands(CRPCTable& t)
+ {
+     static const CRPCCommand commands[]{
+         {"rawtransactions", &sendrawtransaction},
++        {"rawtransactions", &shunkobroadcast},
+         {"rawtransactions", &getprivatebroadcastinfo},
+         {"rawtransactions", &abortprivatebroadcast},
+         {"rawtransactions", &testmempoolaccept},
+diff --git a/src/shunko.cpp b/src/shunko.cpp
+new file mode 100644
+index 0000000..dbd127c
+--- /dev/null
++++ b/src/shunko.cpp
+@@ -0,0 +1,195 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <shunko.h>
++
++#include <compat/compat.h>
++#include <hash.h>
++#include <kernel/chainparams.h>
++#include <logging.h>
++#include <net.h>
++#include <netbase.h>
++#include <node/protocol_version.h>
++#include <protocol.h>
++#include <random.h>
++#include <span.h>
++#include <streams.h>
++#include <util/sock.h>
++#include <util/threadinterrupt.h>
++#include <util/time.h>
++
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
++
++namespace {
++
++using Deadline = std::chrono::steady_clock::time_point;
++
++/** One Bitcoin P2P (v1) message: magic, 12-byte command, length, checksum, payload. */
++std::string Frame(const MessageStartChars& magic, const std::string& command, const std::vector<unsigned char>& payload)
++{
++    std::string out(magic.begin(), magic.end());
++    std::string cmd{command};
++    cmd.resize(CMessageHeader::MESSAGE_TYPE_SIZE, '\0');
++    out += cmd;
++    const uint32_t len = payload.size();
++    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((len >> (8 * i)) & 0xff));
++    const uint256 checksum{Hash(payload)};
++    out.append(reinterpret_cast<const char*>(checksum.begin()), CMessageHeader::CHECKSUM_SIZE);
++    out.append(payload.begin(), payload.end());
++    return out;
++}
++
++void RecvExact(const Sock& sock, unsigned char* buf, size_t len, Deadline deadline)
++{
++    size_t got{0};
++    while (got < len) {
++        const auto now{std::chrono::steady_clock::now()};
++        if (now >= deadline) throw std::runtime_error("timeout");
++        Sock::Event occurred;
++        const auto wait{std::min<std::chrono::milliseconds>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now), std::chrono::milliseconds{1000})};
++        if (!sock.Wait(wait, Sock::RECV, &occurred)) throw std::runtime_error("socket wait failed");
++        if (!(occurred & Sock::RECV)) continue;
++        const ssize_t n{sock.Recv(buf + got, len - got, 0)};
++        if (n == 0) throw std::runtime_error("connection closed by peer");
++        if (n < 0) {
++            const int err{WSAGetLastError()};
++            if (err == WSAEWOULDBLOCK || err == WSAEINTR) continue;
++            throw std::runtime_error("recv failed: " + NetworkErrorString(err));
++        }
++        got += n;
++    }
++}
++
++/** Read the next message; returns its command and payload. */
++std::pair<std::string, std::vector<unsigned char>> RecvMessage(const Sock& sock, const MessageStartChars& magic, Deadline deadline)
++{
++    unsigned char header[CMessageHeader::HEADER_SIZE];
++    RecvExact(sock, header, sizeof(header), deadline);
++    if (!std::equal(magic.begin(), magic.end(), header)) throw std::runtime_error("wrong network magic");
++    const char* cmd_begin{reinterpret_cast<const char*>(header + magic.size())};
++    const std::string command(cmd_begin, strnlen(cmd_begin, CMessageHeader::MESSAGE_TYPE_SIZE));
++    uint32_t len{0};
++    for (int i = 0; i < 4; ++i) len |= uint32_t{header[CMessageHeader::MESSAGE_SIZE_OFFSET + i]} << (8 * i);
++    if (len > MAX_PROTOCOL_MESSAGE_LENGTH) throw std::runtime_error("oversized message");
++    std::vector<unsigned char> payload(len);
++    if (len > 0) RecvExact(sock, payload.data(), len, deadline);
++    // Verify the checksum like core does: corrupted data must not reach the
++    // deserializers below (invalid input would waste time parsing it).
++    const uint256 msg_checksum{Hash(payload)};
++    if (!std::equal(msg_checksum.begin(), msg_checksum.begin() + CMessageHeader::CHECKSUM_SIZE,
++                    header + CMessageHeader::CHECKSUM_OFFSET)) {
++        throw std::runtime_error("bad message checksum");
++    }
++    return {command, payload};
++}
++
++template <typename T>
++void PutLE(std::vector<unsigned char>& out, T value)
++{
++    for (size_t i = 0; i < sizeof(T); ++i) out.push_back(static_cast<unsigned char>((static_cast<uint64_t>(value) >> (8 * i)) & 0xff));
++}
++
++/** A version message that says as little as possible: no services, no addresses, no
++ *  clock, the same user agent as every other node, no transaction relay to us,
++ *  and start_height always 0. The caller never passes the real tip height, so the
++ *  handshake reveals no tip-height, clock, or address information. */
++std::vector<unsigned char> VersionPayload(int start_height)
++{
++    std::vector<unsigned char> p;
++    PutLE<int32_t>(p, PROTOCOL_VERSION);
++    PutLE<uint64_t>(p, 0);                  // services
++    PutLE<int64_t>(p, 0);                   // time
++    for (int i = 0; i < 2; ++i) p.insert(p.end(), 26, 0); // addr_recv, addr_from (services, IPv6, port)
++    PutLE<uint64_t>(p, FastRandomContext().rand64()); // nonce
++    const std::string& ua{strSubVersion};
++    p.push_back(static_cast<unsigned char>(std::min<size_t>(ua.size(), 252)));
++    p.insert(p.end(), ua.begin(), ua.begin() + std::min<size_t>(ua.size(), 252));
++    PutLE<int32_t>(p, start_height);
++    p.push_back(0);                         // relay: false
++    return p;
++}
++
++void DeliverOne(const CTransaction& tx, const CService& target, const MessageStartChars& magic, int start_height, Deadline deadline)
++{
++    std::unique_ptr<Sock> sock;
++    Proxy proxy;
++    if (GetProxy(target.GetNetwork(), proxy)) {
++        // Isolated-stream SOCKS5 credentials: a fresh circuit per connection *if*
++        // the proxy isolates streams by auth (Tor does with IsolateSOCKSAuth).
++        // With a generic SOCKS proxy the streams may share a circuit.
++        const Proxy isolated{proxy.proxy, /*tor_stream_isolation=*/true};
++        bool proxy_failed{false};
++        sock = ConnectThroughProxy(isolated, target.ToStringAddr(), target.GetPort(), proxy_failed);
++        if (!sock) throw std::runtime_error(proxy_failed ? "proxy (Tor) not reachable" : "could not connect through the proxy");
++    } else {
++        if (target.IsPrivacyNet()) throw std::runtime_error("no proxy configured for this network");
++        sock = ConnectDirectly(target, /*manual_connection=*/true);
++        if (!sock) throw std::runtime_error("could not connect");
++    }
++
++    CThreadInterrupt interrupt;
++    const auto send = [&](const std::string& command, const std::vector<unsigned char>& payload) {
++        const auto left{std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())};
++        if (left.count() <= 0) throw std::runtime_error("timeout");
++        sock->SendComplete(Frame(magic, command, payload), left, interrupt);
++    };
++
++    send(NetMsgType::VERSION, VersionPayload(start_height));
++    bool got_version{false}, got_verack{false};
++    while (!got_version || !got_verack) {
++        const auto [command, payload]{RecvMessage(*sock, magic, deadline)};
++        if (command == NetMsgType::VERSION && !got_version) {
++            got_version = true;
++            send(NetMsgType::VERACK, {});
++        } else if (command == NetMsgType::VERACK) {
++            got_verack = true;
++        }
++    }
++
++    DataStream ss;
++    ss << TX_WITH_WITNESS(tx);
++    const std::vector<unsigned char> tx_bytes{UCharCast(ss.data()), UCharCast(ss.data() + ss.size())};
++    send(NetMsgType::TX, tx_bytes);
++
++    // Messages are processed in order: the pong proves the transaction was processed.
++    std::vector<unsigned char> ping;
++    PutLE<uint64_t>(ping, FastRandomContext().rand64());
++    send(NetMsgType::PING, ping);
++    while (true) {
++        const auto [command, payload]{RecvMessage(*sock, magic, deadline)};
++        if (command == NetMsgType::PONG && payload == ping) return;
++        if (command == NetMsgType::PING) send(NetMsgType::PONG, payload);
++    }
++}
++
++} // namespace
++
++bool ShunkoTargetIsPrivate(const CService& target)
++{
++    Proxy proxy;
++    return GetProxy(target.GetNetwork(), proxy);
++}
++
++std::vector<ShunkoDelivery> ShunkoDeliver(const CTransaction& tx, const std::vector<CService>& targets,
++                                         const CChainParams& params, int start_height,
++                                         std::chrono::seconds timeout)
++{
++    std::vector<ShunkoDelivery> results;
++    for (const CService& target : targets) {
++        ShunkoDelivery r;
++        r.target = target.ToStringAddrPort();
++        try {
++            DeliverOne(tx, target, params.MessageStart(), start_height, std::chrono::steady_clock::now() + timeout);
++            r.delivered = true;
++        } catch (const std::exception& e) {
++            r.error = e.what();
++        }
++        results.push_back(r);
++    }
++    const auto delivered{std::count_if(results.begin(), results.end(), [](const auto& r) { return r.delivered; })};
++    LogDebug(BCLog::NET, "Shunko: transaction handed to %d of %d nodes over one-shot connections\n", delivered, results.size());
++    return results;
++}
+diff --git a/src/shunko.h b/src/shunko.h
+new file mode 100644
+index 0000000..e881c84
+--- /dev/null
++++ b/src/shunko.h
+@@ -0,0 +1,45 @@
++// Copyright (c) 2026 triplecN
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_SHUNKO_H
++#define BITCOIN_SHUNKO_H
++
++#include <netaddress.h>
++#include <primitives/transaction.h>
++
++#include <chrono>
++#include <string>
++#include <vector>
++
++class CChainParams;
++
++/**
++ * Shunko Protocol (transport layer only; consensus and the public ledger are unchanged).
++ *
++ * A transaction created by this node is never announced by this node. Instead it is
++ * handed to a few other nodes over short-lived connections of their own: each one is a
++ * fresh Tor circuit (SOCKS5 with random credentials, so Tor isolates the stream), does a
++ * plain version/verack handshake, sends the transaction, waits for a pong so it knows the
++ * transaction was processed, and disconnects. Those nodes then relay the transaction as
++ * if it were theirs. This makes it harder to link the transaction to this node's
++ * long-lived connections; receivers see only a Tor client, but timing, amounts
++ * and address reuse can still correlate activity.
++ */
++struct ShunkoDelivery {
++    std::string target;
++    bool delivered{false};
++    std::string error;
++};
++
++/** Hand `tx` to each target over its own one-shot connection (through the configured
++ *  proxy for that network, if any). Blocks until every attempt finished or timed out. */
++std::vector<ShunkoDelivery> ShunkoDeliver(const CTransaction& tx, const std::vector<CService>& targets,
++                                         const CChainParams& params, int start_height,
++                                         std::chrono::seconds timeout);
++
++/** Whether a one-shot connection to `target` would go through a proxy (Tor), i.e. would not
++ *  reveal this node's IP address to the receiving node. */
++bool ShunkoTargetIsPrivate(const CService& target);
++
++#endif // BITCOIN_SHUNKO_H
+-- 
+2.53.0.windows.3
+

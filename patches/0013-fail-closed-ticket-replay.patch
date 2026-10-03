@@ -1,0 +1,154 @@
+From fc58a1123fc68dce1298c8c28fc4e98f1fbba4f6 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 13/20] fail closed when the ticket replay window cannot be read
+
+EmbeddedTicketIds returned an empty set when a history block could not be
+read, which silently disabled cross-block replay detection: a replayed ticket
+could be embedded twice and paid twice from the same reservoir (no inflation,
+but the other ticket holders get less), and a node that hit the read failure
+could accept a block other nodes rejected.
+
+- EmbeddedTicketIds reports nullopt again, and a failed read is never cached.
+- A real connect fails closed (retryable state.Error) when the window cannot
+  be read. Template validation may continue only when the block carries no
+  tickets; PerPoolCollect embeds none while a history read fails, so mining
+  degrades instead of wedging.
+- The window is populated at connect time (CacheEmbeddedTicketIds), so a
+  running node serves it from memory and a disk fault cannot change the
+  verdict. The 50/50 fee split and the 28-day reservoir are untouched.
+
+No block format change: the window is derived from data already committed in
+the coinbase.
+---
+ src/per.cpp | 73 +++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 46 insertions(+), 27 deletions(-)
+
+diff --git a/src/per.cpp b/src/per.cpp
+index 8948446..39c1034 100644
+--- a/src/per.cpp
++++ b/src/per.cpp
+@@ -182,18 +182,12 @@ std::deque<uint256> g_embedded_order;
+ 
+ /** Ticket ids embedded by pindex's block (cached, bounded).
+  *
+- *  Deliberate limitation, recorded so it is not "fixed" into a worse state: when
+- *  the block cannot be read, PerBlockTickets returns nullopt but this function
+- *  returns an EMPTY set (and caches that answer). The callers' "retryable on
+- *  nullopt" guards therefore never fire on a read failure. Propagating the nullopt
+- *  was tried and breaks template building, because a read returning nothing is
+- *  normal on the path the miner takes; that is why the behaviour stays. The
+- *  consequence is recorded in SECURITY.md ("Known accepted risks"): a read failure
+- *  disables cross-block replay detection for that window, so a replayed ticket can
+- *  be embedded twice and paid twice from the same reservoir (no inflation, but the
+- *  other ticket holders get less), and a node that hits the failure can accept a
+- *  block other nodes reject. Fixing this needs the mining path to tolerate the
+- *  nullopt first; do not flip the return value on its own. */
++ *  nullopt means the block could not be read. Callers must fail closed (real
++ *  connect) or skip the ticket (mining), never treat it as "no tickets": an empty
++ *  answer would let a replayed ticket through. A failed read is never cached, so a
++ *  transient fault heals on the next call. The cache is populated when a block is
++ *  connected (CacheEmbeddedTicketIds), so a running node serves its replay window
++ *  from memory and a disk fault cannot change the verdict. */
+ std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
+                                                     const node::BlockManager& blockman)
+ {
+@@ -205,17 +199,11 @@ std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
+             return std::set<uint256>(it->second.begin(), it->second.end());
+         }
+     }
++    auto t{PerBlockTickets(pindex, blockman)};
++    if (!t) return std::nullopt;
+     std::set<uint256> ids;
+-    bool readable{false};
+-    if (auto t{PerBlockTickets(pindex, blockman)}) {
+-        readable = true;
+-        for (const auto& x : *t) ids.insert(x.Id());
+-    }
+-    // Only cache successful reads. A failed read still answers "no tickets" for this
+-    // call (see the comment above), but caching that answer would keep the blind
+-    // window open until the entry is evicted. Leaving it uncached makes the next
+-    // caller retry the disk read, so a transient fault heals by itself.
+-    if (readable) {
++    for (const auto& x : *t) ids.insert(x.Id());
++    {
+         std::lock_guard<std::mutex> lock{g_embedded_mutex};
+         g_embedded_cache[hash] = std::vector<uint256>(ids.begin(), ids.end());
+         g_embedded_order.push_back(hash);
+@@ -227,6 +215,23 @@ std::optional<std::set<uint256>> EmbeddedTicketIds(const CBlockIndex* pindex,
+     return ids;
+ }
+ 
++/** Record the ticket ids of a block that just connected, so the replay window of
++ *  the following blocks is served from memory instead of from block reads. Keyed
++ *  by block hash, so a hit is exact. */
++void CacheEmbeddedTicketIds(const CBlockIndex* pindex, const std::vector<uint256>& ids)
++{
++    if (!pindex) return;
++    std::lock_guard<std::mutex> lock{g_embedded_mutex};
++    const uint256 hash{pindex->GetBlockHash()};
++    if (g_embedded_cache.count(hash)) return;
++    g_embedded_cache[hash] = ids;
++    g_embedded_order.push_back(hash);
++    while (g_embedded_order.size() > PER_EMBEDDED_CACHE_MAX) {
++        g_embedded_cache.erase(g_embedded_order.front());
++        g_embedded_order.pop_front();
++    }
++}
++
+ } // namespace
+ 
+ bool PerTicketPowValid(const PerTicket& ticket, uint32_t anchor_nbits,
+@@ -508,13 +513,18 @@ std::vector<PerTicket> PerPoolCollect(const CBlockIndex* tip,
+         // wedges this miner until the anchor ages out. Cached: no disk on hits.
+         {
+             bool embedded{false};
++            bool unknown{false};
+             const CBlockIndex* b{tip};
+             for (int i = 0; i < params.nPerTicketWindow && b; ++i) {
+                 auto hist{EmbeddedTicketIds(b, blockman)};
+-                if (!hist) break;
++                if (!hist) { unknown = true; break; }
+                 if (hist->count(id)) { embedded = true; break; }
+                 b = b->pprev;
+             }
++            // Cannot prove this ticket is not already embedded: embed none rather
++            // than risk a replay. Mining continues without tickets until a history
++            // read succeeds again.
++            if (unknown) return {};
+             if (embedded) continue;
+         }
+         out.push_back(t);
+@@ -627,10 +637,16 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+         const CBlockIndex* a{parent};
+         for (int i = 0; i < params.nPerTicketWindow && a; ++i) {
+             auto hist{EmbeddedTicketIds(a, blockman)};
+-            // EmbeddedTicketIds returns an empty set, not nullopt, when the block
+-            // cannot be read (see its comment). Keep this guard for an eventual
+-            // implementation that distinguishes the two; today it is unreachable.
+-            if (!hist) return state.Error("cannot read ticket history");
++            if (!hist) {
++                // Fail closed on a real connect: a replayed ticket must never be
++                // accepted just because a history block could not be read. A
++                // template carries no tickets when the history is unreadable
++                // (PerPoolCollect), so fJustCheck can continue.
++                if (drop_pool || per.block_tickets > 0) {
++                    return state.Error("cannot read ticket history");
++                }
++                break;
++            }
+             seen.insert(hist->begin(), hist->end());
+             a = a->pprev;
+         }
+@@ -746,6 +762,9 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+     // Skipped for fJustCheck: TestBlockValidity runs on every template built by
+     // CreateNewBlock, and draining there would empty the pool before mining.
+     if (drop_pool) {
++        // Keep this block's ticket ids in memory for the replay window of the
++        // blocks that follow, so they do not have to read it back from disk.
++        CacheEmbeddedTicketIds(pindex, ids);
+         std::lock_guard<std::mutex> lock{g_pool_mutex};
+         for (const auto& id : ids) g_pool.erase(id);
+         if (!ids.empty()) ++g_pool_version;
+-- 
+2.53.0.windows.3
+

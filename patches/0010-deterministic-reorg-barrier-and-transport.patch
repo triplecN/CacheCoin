@@ -1,0 +1,267 @@
+From db2e61d5015d27fba1a016878cd895dcfb9752c0 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 10/20] a deterministic re-org barrier and the transport fixes
+ around it
+
+The release is measured from the candidate (36 blocks past the fork) so
+every node switches on the same block; the refusal stays local. Shunko now
+requires a hidden-service target, and the perticket path bounds and
+rate-limits before it spends RandomX.
+---
+ src/net_processing.cpp | 38 ++++++++++++++++++--
+ src/rpc/mempool.cpp    | 12 +++++--
+ src/shunko.cpp         |  7 ++++
+ src/validation.cpp     | 78 +++++++++++++++++++++++++++++-------------
+ 4 files changed, 105 insertions(+), 30 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 437b054..24a0289 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -251,7 +251,7 @@ struct Peer {
+ 
+     /** CacheCoin PER: token bucket limiting how many perticket messages we verify from this
+      *  peer (each costs one RandomX hash). Refilled over time; guarded by cs_main. */
+-    double m_per_ticket_tokens GUARDED_BY(::cs_main){16};
++    double m_per_ticket_tokens GUARDED_BY(::cs_main){4};
+     std::chrono::microseconds m_per_ticket_last GUARDED_BY(::cs_main){0};
+ 
+     //! Whether this peer is an inbound connection
+@@ -820,6 +820,10 @@ private:
+      * their own locks.
+      */
+     std::map<NodeId, PeerRef> m_peer_map GUARDED_BY(m_peer_mutex);
++    /** When the PER pool was last swept. A full pool is swept on a timer rather than on every
++     *  relayed ticket, because the sweep copies the pool and does a block index lookup per
++     *  entry under cs_main. */
++    std::chrono::microseconds m_last_pool_sweep GUARDED_BY(::cs_main){0};
+ 
+     /** Map maintaining per-node state. */
+     std::map<NodeId, CNodeState> m_node_states GUARDED_BY(cs_main);
+@@ -4981,6 +4985,16 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+         // So: cheap checks + chain snapshot under a brief lock, hash with no lock held,
+         // then re-check under lock (the tip may have moved while hashing). Valid, new
+         // tickets are pooled and relayed onward (see per.h).
++        // Bound the size before deserialising, not after. The payout is a CScript
++        // whose CompactSize length comes straight from the peer, so deserialising
++        // first allocates whatever it claims and only the check below rejects it. A
++        // well formed ticket is 32 bytes of anchor, a varint, a short payout
++        // script and a 4 byte nonce, with generous headroom.
++        constexpr size_t PERTICKET_MAX_SIZE{32 + 9 + 512 + 4};
++        if (vRecv.size() > PERTICKET_MAX_SIZE) {
++            Misbehaving(peer, "oversized perticket");
++            return;
++        }
+         PerTicket ticket;
+         vRecv >> ticket;
+         // Lock-free sanity first: payout must be a spendable small script.
+@@ -4992,7 +5006,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+         uint32_t anchor_nbits{0};
+         {
+             LOCK(cs_main);
+-            constexpr double refill_per_second{8.0}, bucket_max{16.0};
++            // The bucket lives on the Peer, so a new TCP connection restarts it at
++            // the cap, and the initial value has to match the cap or the first
++            // message of every connection would be charged the old, larger one.
++            // At 20 ms per RandomX hash a cap of 16 was 320 ms of free hashing
++            // per reconnection; 4 brings that to 80 ms and is still faster than
++            // any honest ticket miner produces them.
++            constexpr double refill_per_second{4.0}, bucket_max{4.0};
+             const auto now{GetTime<std::chrono::microseconds>()};
+             if (peer.m_per_ticket_last.count() != 0) {
+                 // Clamp: a backward clock slew must not stall the bucket, and a
+@@ -5011,7 +5031,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+                 // Relay-only nodes never template or mine, so nothing else
+                 // sweeps for them: one sweep before dropping, or stale tickets
+                 // wedge the pool forever.
+-                PerPoolSweep(m_chainman.ActiveChain().Tip(), m_chainman.m_blockman, m_chainman.GetConsensus());
++                // Relay-only nodes never template or mine, so nothing else sweeps for
++                // them and stale tickets would wedge the pool for good. Sweeping copies
++                // the whole pool and does a block index lookup per entry under cs_main,
++                // so doing it on every message let one peer hold cs_main down over and
++                // over. A periodic sweep still keeps the pool moving; in between the
++                // pool is full and tickets are dropped, which is what happened anyway.
++                const auto sweep_now{GetTime<std::chrono::microseconds>()};
++                const bool sweep_due{m_last_pool_sweep.count() == 0 ||
++                  Ticks<SecondsDouble>(sweep_now - m_last_pool_sweep) >= 10.0};
++                if (sweep_due) {
++                  m_last_pool_sweep = sweep_now;
++                  PerPoolSweep(m_chainman.ActiveChain().Tip(), m_chainman.m_blockman, m_chainman.GetConsensus());
++                }
+                 if (PerPoolSize() >= 10000) {
+                     LogDebug(BCLog::NET, "dropping perticket: pool full\n");
+                     return;
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index ad32642..e04cb28 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -252,9 +252,15 @@ static RPCHelpMan shunkobroadcast()
+                 }
+                 std::shuffle(candidates.begin(), candidates.end(), FastRandomContext());
+             }
+-            if (!regtest) {
+-                // Without a proxy the receiving node would see this node's IP address.
+-                candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [](const CService& s) { return !ShunkoTargetIsPrivate(s); }),
++            {
++                // Without a hidden-service target the receiving node would see this
++                // node's IP address. The check also runs on regtest so it is
++                // reachable from the test suite; loopback is exempt there because
++                // regtest has no onion services to hand over to and the suites
++                // hand over to 127.0.0.1.
++                const bool clearnet_ok{regtest};
++                candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
++                                                [&](const CService& s) { return !(clearnet_ok && s.IsLocal()) && !ShunkoTargetIsPrivate(s); }),
+                                  candidates.end());
+             }
+             if (candidates.empty()) {
+diff --git a/src/shunko.cpp b/src/shunko.cpp
+index dbd127c..29e4672 100644
+--- a/src/shunko.cpp
++++ b/src/shunko.cpp
+@@ -169,6 +169,13 @@ void DeliverOne(const CTransaction& tx, const CService& target, const MessageSta
+ 
+ bool ShunkoTargetIsPrivate(const CService& target)
+ {
++    // Shunko's whole premise is that the last hop is a hidden service, so the
++    // target has to be one. Asking only whether a proxy is configured is not the
++    // same question: GetProxy() answers for whatever network the address belongs
++    // to, and a global -proxy is configured for all of them. A clearnet IPv4
++    // target therefore passed the old check and the hand-over went out through a
++    // Tor exit, which is an observer with no reason to protect the sender.
++    if (!target.IsPrivacyNet()) return false;
+     Proxy proxy;
+     return GetProxy(target.GetNetwork(), proxy);
+ }
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 6b61d3f..b1c0c1e 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2635,7 +2635,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state,
+     }
+     const auto prev_per{GetPerState(pindex->pprev, m_blockman)};
+     if (!prev_per) {
+-        return FatalError(m_chainman.GetNotifications(), state, Untranslated("Failed to read the PER state of the previous block"));
++        // Retryable, like the two identical conditions inside
++        // CheckPerTicketsAndPayouts. A transient read fault should leave the block
++        // unvalidated and be tried again later, not take the node down; marking it
++        // invalid would be worse still, because nothing about the block is wrong.
++        return state.Error("failed to read the PER state of the previous block");
+     }
+     CAmount per_payouts{0};
+     // TestBlockValidity (fJustCheck, run for every template) must not drain
+@@ -3210,23 +3214,31 @@ static void SetReorgRefusedWarning(ChainstateManager& chainman, bool flag)
+         chainman.GetNotifications().warningSet(
+             kernel::Warning::REORG_DEPTH_REFUSED,
+             strprintf(_("Warning: the re-org barrier is refusing a competing chain with more work (see getchaintips). "
+-                        "The network may be split; this node switches once that chain leads by %d blocks of work."),
+-                      REORG_HEAL_LEAD_BLOCKS));
++                        "The network may be split; this node switches once that chain is more than %d blocks past "
++                      "the point where the two diverged."),
++                    MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS));
+     } else {
+         chainman.GetNotifications().warningUnset(kernel::Warning::REORG_DEPTH_REFUSED);
+     }
+ }
+ 
+ /**
+- * CacheCoin anti-51% barrier: switching from `reference` (the tip the node had when it
+- * started choosing) to `candidate` must not disconnect more than MAX_REORG_DEPTH blocks,
+- * unless the candidate branch either
+- *  - carries more than twice the work the reference chain gained since the fork, or
+- *  - leads the reference chain by REORG_HEAL_LEAD_BLOCKS blocks of work.
+- * The second condition bounds how long honest nodes separated by a network partition
+- * can stay apart: once one side has out-mined the other by that margin, every node
+- * converges on it. Without it a hashrate split below 2:1 would never heal.
+- */
++ * CacheCoin anti-51% barrier. A candidate that extends the chain this node is
++ * already on is always followed: nothing is disconnected, so it is ordinary
++ * catch-up and may be any distance behind.
++ *
++ * Otherwise the switch must not disconnect more than MAX_REORG_DEPTH blocks of
++ * this node's chain, unless the competing branch has already run
++ * MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS blocks past the point where the two
++ * diverged.
++ *
++ * The limit is what this node gives up, so it is measured from this node's own
++ * tip. The release is deliberately not: it is measured from the candidate, so
++ * every node lets the same branch through on the same block. That is what
++ * bounds how long a partition can hold the network apart, and it is why a
++ * release stated in work against a local tip is not good enough: a node that
++ * ran ahead released earlier than one that lagged, and the two disagreed about
++ * which chain was active. */
+ static bool ReorgPermitted(const CBlockIndex* reference, const CBlockIndex* candidate)
+ {
+     if (reference == nullptr) return true;
+@@ -3235,9 +3247,23 @@ static bool ReorgPermitted(const CBlockIndex* reference, const CBlockIndex* cand
+     if (candidate == nullptr) return false;
+     const CBlockIndex* fork{LastCommonAncestor(reference, candidate)};
+     if (fork == nullptr) return false;
+-    if (reference->nHeight - fork->nHeight <= MAX_REORG_DEPTH) return true;
+-    if (candidate->nChainWork - fork->nChainWork > (reference->nChainWork - fork->nChainWork) * 2) return true;
+-    return candidate->nChainWork >= reference->nChainWork + GetBlockProof(*reference) * REORG_HEAL_LEAD_BLOCKS;
++    // The candidate builds on this node's own tip, so switching to it disconnects
++    // nothing. This is catch-up, not a re-organization, and it has to keep working
++    // however far behind this node is: measuring the candidate's distance from the
++    // fork instead would report the whole backlog here and refuse everything from
++    // the 6th block onward, leaving a node that was briefly offline unable to
++    // advance at all.
++    if (fork == reference) return true;
++    // A real fork. What the barrier limits is how much of this node's chain the
++    // switch would undo.
++    const int rollback{reference->nHeight - fork->nHeight};
++    if (rollback <= MAX_REORG_DEPTH) return true;
++    // Released only once the competing branch is far enough past the fork that the
++    // refusal can no longer be holding the network apart. Stated against the
++    // candidate so that every node releases on the same block and a split always
++    // converges, rather than each node waiting for a margin measured from a tip
++    // that differs between them.
++    return candidate->nHeight - fork->nHeight > MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS;
+ }
+ 
+ /**
+@@ -3247,7 +3273,9 @@ static bool ReorgPermitted(const CBlockIndex* reference, const CBlockIndex* cand
+  * CacheCoin: among those, only a chain the re-org barrier permits relative to
+  * `reorg_reference` (see ReorgPermitted). Evaluating it against the tip the caller
+  * started from, not the current tip, lets a node that hits an invalid block halfway
+- * through a permitted re-org return to where it started.
++ * through a permitted re-org return to where it started. The reference only fixes
++ * where the fork point is; the verdict itself is a function of the candidate, so
++ * it does not depend on how far along this node was when it started.
+  */
+ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+ {
+@@ -3325,10 +3353,11 @@ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+             if (best_refused != nullptr && best_refused != last_logged) {
+                 last_logged = best_refused;
+                 const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
+-                LogInfo("CacheCoin: refused re-org of %d blocks (max %d unless the other branch has more than 2x the work since the fork, "
+-                        "or leads by %d blocks of work). Tip: %d, Fork: %d, Candidate: %d %s\n",
+-                          reorg_reference->nHeight - fork->nHeight, MAX_REORG_DEPTH, REORG_HEAL_LEAD_BLOCKS,
+-                          reorg_reference->nHeight, fork->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
++                LogInfo("CacheCoin: refused re-org to a branch %d blocks past the fork point at height %d "
++                          "(permitted up to %d, released once past %d). Tip: %d, Candidate: %d %s\n",
++                            best_refused->nHeight - fork->nHeight, fork->nHeight, MAX_REORG_DEPTH,
++                            MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS,
++                            reorg_reference->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
+             }
+             SetReorgRefusedWarning(m_chainman, best_refused != nullptr);
+             return pindexNew;
+@@ -3339,10 +3368,11 @@ CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+         if (best_refused != nullptr && best_refused != last_logged) {
+             last_logged = best_refused;
+             const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
+-            LogInfo("CacheCoin: refused re-org of %d blocks (max %d unless the other branch has more than 2x the work since the fork, "
+-                    "or leads by %d blocks of work). Tip: %d, Fork: %d, Candidate: %d %s\n",
+-                      reorg_reference->nHeight - fork->nHeight, MAX_REORG_DEPTH, REORG_HEAL_LEAD_BLOCKS,
+-                      reorg_reference->nHeight, fork->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
++            LogInfo("CacheCoin: refused re-org to a branch %d blocks past the fork point at height %d "
++                          "(permitted up to %d, released once past %d). Tip: %d, Candidate: %d %s\n",
++                            best_refused->nHeight - fork->nHeight, fork->nHeight, MAX_REORG_DEPTH,
++                            MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS,
++                            reorg_reference->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
+         }
+         SetReorgRefusedWarning(m_chainman, best_refused != nullptr);
+         if (!candidates_changed) return nullptr;
+-- 
+2.53.0.windows.3
+

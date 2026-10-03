@@ -1,0 +1,541 @@
+From 786fcaf53ff2edb02e94af1fc1fa27f5dce2e7f3 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 02/20] chain parameters and genesis
+
+CacheCoin mainnet and regtest parameters (60 s spacing, halving every
+1,051,200 blocks, message start, ports, address prefixes) and the mined
+genesis block. -testnet, -testnet4 and -signet are refused.
+---
+ src/chainparams.cpp        |   7 +
+ src/chainparamsbase.cpp    |  22 +--
+ src/consensus/amount.h     |   8 +-
+ src/consensus/consensus.h  |  18 ++-
+ src/kernel/chainparams.cpp | 269 +++++++++++++++++--------------------
+ 5 files changed, 163 insertions(+), 161 deletions(-)
+
+diff --git a/src/chainparams.cpp b/src/chainparams.cpp
+index 32c3bff..580b3e2 100644
+--- a/src/chainparams.cpp
++++ b/src/chainparams.cpp
+@@ -139,6 +139,13 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
+ 
+ void SelectParams(const ChainType chain)
+ {
++    // CacheCoin defines no public test network. The testnet, testnet4 and signet
++    // parameters are still Bitcoin's (their genesis blocks fail RandomX), so refuse
++    // to run them. ChainType::TESTNET4 is listed
++    // explicitly because upstream v31.1 added it.
++    if (chain == ChainType::TESTNET || chain == ChainType::TESTNET4 || chain == ChainType::SIGNET) {
++        throw std::runtime_error("CacheCoin has no public test network: -testnet, -testnet4 and -signet are disabled. Use -regtest for local testing.");
++    }
+     SelectBaseParams(chain);
+     globalChainParams = CreateChainParams(gArgs, chain);
+ }
+diff --git a/src/chainparamsbase.cpp b/src/chainparamsbase.cpp
+index d816d1a..7554bb5 100644
+--- a/src/chainparamsbase.cpp
++++ b/src/chainparamsbase.cpp
+@@ -13,16 +13,16 @@
+ 
+ void SetupChainParamsBaseOptions(ArgsManager& argsman)
+ {
+-    argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: " LIST_CHAIN_NAMES, ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: main). Allowed values: main, regtest (CacheCoin has no public test network)", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
+                  "This is intended for regression testing tools and app development. Equivalent to -chain=regtest.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-testactivationheight=name@height.", "Set the activation height of 'name' (segwit, bip34, dersig, cltv, csv). (regtest-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+-    argsman.AddArg("-testnet", "Use the testnet3 chain. Equivalent to -chain=test. Support for testnet3 is deprecated and will be removed in an upcoming release. Consider moving to testnet4 now by using -testnet4.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+-    argsman.AddArg("-testnet4", "Use the testnet4 chain. Equivalent to -chain=testnet4.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-testnet", "Disabled: CacheCoin has no public test network (use -regtest).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-testnet4", "Disabled: CacheCoin has no public test network (use -regtest).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+     argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (regtest-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+-    argsman.AddArg("-signet", "Use the signet chain. Equivalent to -chain=signet. Note that the network is defined by the -signetchallenge parameter", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+-    argsman.AddArg("-signetchallenge", "Blocks must satisfy the given script to be considered valid (only for signet networks; defaults to the global default signet test network challenge)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
+-    argsman.AddArg("-signetseednode", "Specify a seed node for the signet network, in the hostname[:port] format, e.g. sig.net:1234 (may be used multiple times to specify multiple seed nodes; defaults to the global default signet test network seed node(s))", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-signet", "Disabled: CacheCoin has no public test network (use -regtest).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
++    argsman.AddArg("-signetchallenge", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS | ArgsManager::DEBUG_ONLY);
++    argsman.AddArg("-signetseednode", "Unused (signet is disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS | ArgsManager::DEBUG_ONLY);
+ }
+ 
+ static std::unique_ptr<CBaseChainParams> globalChainBaseParams;
+@@ -41,15 +41,15 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain)
+ {
+     switch (chain) {
+     case ChainType::MAIN:
+-        return std::make_unique<CBaseChainParams>("", 8332);
++        return std::make_unique<CBaseChainParams>("", 29332);
+     case ChainType::TESTNET:
+-        return std::make_unique<CBaseChainParams>("testnet3", 18332);
++        return std::make_unique<CBaseChainParams>("testnet3", 39332);
+     case ChainType::TESTNET4:
+-        return std::make_unique<CBaseChainParams>("testnet4", 48332);
++        return std::make_unique<CBaseChainParams>("testnet4", 39332);
+     case ChainType::SIGNET:
+-        return std::make_unique<CBaseChainParams>("signet", 38332);
++        return std::make_unique<CBaseChainParams>("signet", 39332);
+     case ChainType::REGTEST:
+-        return std::make_unique<CBaseChainParams>("regtest", 18443);
++        return std::make_unique<CBaseChainParams>("regtest", 29443);
+     }
+     assert(false);
+ }
+diff --git a/src/consensus/amount.h b/src/consensus/amount.h
+index 2a65a83..ac00f09 100644
+--- a/src/consensus/amount.h
++++ b/src/consensus/amount.h
+@@ -12,7 +12,11 @@
+ typedef int64_t CAmount;
+ 
+ /** The amount of satoshis in one BTC. */
+-static constexpr CAmount COIN = 100000000;
++// CacheCoin (CCCN) Atomic Base Unit: "Cache"
++// 1 CCCN = 100,000,000 Cache (10^8 atomic units)
++// 1 Cent = 1,000,000 Cache (0.01 CCCN)
++static constexpr CAmount CACHE = 1;
++static constexpr CAmount COIN = 100000000 * CACHE;
+ 
+ /** No amount larger than this (in satoshi) is valid.
+  *
+@@ -23,7 +27,7 @@ static constexpr CAmount COIN = 100000000;
+  * critical; in unusual circumstances like a(nother) overflow bug that allowed
+  * for the creation of coins out of thin air modification could lead to a fork.
+  * */
+-static constexpr CAmount MAX_MONEY = 21000000 * COIN;
++static constexpr CAmount MAX_MONEY = 21020400 * COIN;
+ inline bool MoneyRange(const CAmount& nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
+ 
+ #endif // BITCOIN_CONSENSUS_AMOUNT_H
+diff --git a/src/consensus/consensus.h b/src/consensus/consensus.h
+index 71b5fe2..e1ea40e 100644
+--- a/src/consensus/consensus.h
++++ b/src/consensus/consensus.h
+@@ -10,9 +10,21 @@
+ #include <cstdlib>
+ 
+ /** The maximum allowed size for a serialized block, in bytes (only for buffer size limits) */
+-static const unsigned int MAX_BLOCK_SERIALIZED_SIZE = 4000000;
+-/** The maximum allowed weight for a block, see BIP 141 (network rule) */
+-static const unsigned int MAX_BLOCK_WEIGHT = 4000000;
++static const unsigned int MAX_BLOCK_SERIALIZED_SIZE = 2000000;
++/** The maximum allowed weight for a block, see BIP 141 (network rule).
++ *  CacheCoin: 2,000,000 weight units per 60 s block (Bitcoin: 4,000,000 per 10 minutes), i.e.
++ *  at most 2 MB of serialized data, of which at most 500 kB is non-witness data. Weight is
++ *  3 x base size + total size, so a block's serialized size never exceeds its weight: keeping
++ *  MAX_BLOCK_WEIGHT <= MAX_BLOCK_SERIALIZED_SIZE guarantees every valid block fits the
++ *  serialization limit used when reading block files. */
++static const unsigned int MAX_BLOCK_WEIGHT = 2000000;
++static_assert(MAX_BLOCK_WEIGHT <= MAX_BLOCK_SERIALIZED_SIZE, "a block within the weight limit must fit the serialization limit");
++/** CacheCoin anti-51% barrier: deepest chain reorganization accepted without supermajority work (network rule) */
++static const int MAX_REORG_DEPTH = 5;
++/** CacheCoin anti-51% barrier: a deeper reorganization is still accepted once the other branch
++ *  leads the active chain by this many blocks of work (at the active tip's difficulty), so nodes
++ *  split by a network partition converge again instead of staying apart forever (network rule) */
++static const int REORG_HEAL_LEAD_BLOCKS = 30;
+ /** The maximum allowed number of signature check operations in a block (network rule) */
+ static const int64_t MAX_BLOCK_SIGOPS_COST = 80000;
+ /** Coinbase transaction outputs can only be spent after this number of new blocks (network rule) */
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index 64809a7..dd205f1 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -5,7 +5,8 @@
+ 
+ #include <kernel/chainparams.h>
+ 
+-#include <chainparamsseeds.h>
++// CacheCoin: chainparamsseeds.h (Bitcoin's hard-coded peers) is not included; no chain
++// uses fixed seeds yet. Regenerate it with contrib/seeds for CacheCoin peers first.
+ #include <consensus/amount.h>
+ #include <consensus/merkle.h>
+ #include <consensus/params.h>
+@@ -54,6 +55,35 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
+     return genesis;
+ }
+ 
++/**
++ * CacheCoin mainnet genesis block: same layout as CreateGenesisBlock() above, except
++ * that the first scriptSig push is the genesis nBits (0x1e0ffff0) instead of Bitcoin's
++ * 486604799. That is the exact coinbase built by genesis_miner.py when the genesis was
++ * mined (txid = merkle root 3c80c391...), and only with it does the header hash to
++ * 1bc3387d... with nonce 1349294. Using Bitcoin's scriptSig gives a different
++ * transaction (48c33a0d...), fails the genesis asserts and aborts the node at startup.
++ */
++static CBlock CreateCacheCoinGenesisBlock(const char* pszTimestamp, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
++{
++    CMutableTransaction txNew;
++    txNew.version = 1;
++    txNew.vin.resize(1);
++    txNew.vout.resize(1);
++    txNew.vin[0].scriptSig = CScript() << int64_t{nBits} << CScriptNum(4) << std::vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
++    txNew.vout[0].nValue = genesisReward;
++    txNew.vout[0].scriptPubKey = genesisOutputScript;
++
++    CBlock genesis;
++    genesis.nTime    = nTime;
++    genesis.nBits    = nBits;
++    genesis.nNonce   = nNonce;
++    genesis.nVersion = nVersion;
++    genesis.vtx.push_back(MakeTransactionRef(std::move(txNew)));
++    genesis.hashPrevBlock.SetNull();
++    genesis.hashMerkleRoot = BlockMerkleRoot(genesis);
++    return genesis;
++}
++
+ /**
+  * Build the genesis block. Note that the output of its generation
+  * transaction cannot be spent since it did not originally exist in the
+@@ -81,21 +111,23 @@ public:
+         m_chain_type = ChainType::MAIN;
+         consensus.signet_blocks = false;
+         consensus.signet_challenge.clear();
+-        consensus.nSubsidyHalvingInterval = 210000;
+-        consensus.script_flag_exceptions.emplace( // BIP16 exception
+-            uint256{"00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"}, SCRIPT_VERIFY_NONE);
+-        consensus.script_flag_exceptions.emplace( // Taproot exception
+-            uint256{"0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"}, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS);
+-        consensus.BIP34Height = 227931;
+-        consensus.BIP34Hash = uint256{"000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"};
+-        consensus.BIP65Height = 388381; // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
+-        consensus.BIP66Height = 363725; // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
+-        consensus.CSVHeight = 419328; // 000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5
+-        consensus.SegwitHeight = 481824; // 0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893
+-        consensus.MinBIP9WarningHeight = 483840; // segwit activation height + miner confirmation window
+-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
++        consensus.nSubsidyHalvingInterval = 1051200; // ~2 years of 60 s blocks
++        // CacheCoin starts with every soft fork Bitcoin accumulated already active
++        // (BIP34/65/66, CSV, SegWit, Taproot), so native SegWit (cccn1...) outputs are
++        // spendable from the first mined block on. Same approach as regtest.
++        consensus.BIP34Height = 1;
++        consensus.BIP34Hash = uint256{};
++        consensus.BIP65Height = 1;
++        consensus.BIP66Height = 1;
++        consensus.CSVHeight = 1;
++        consensus.SegwitHeight = 0;
++        consensus.MinBIP9WarningHeight = 0;
++        // Minimum difficulty (~4096 RandomX hashes per block). Blocks 1-60 are mined at this
++        // difficulty before LWMA takes over. It must be at least as easy as the genesis target
++        // (nBits 0x1e0ffff0), otherwise the genesis block fails the proof-of-work range check.
++        consensus.powLimit = uint256{"000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
+-        consensus.nPowTargetSpacing = 10 * 60;
++        consensus.nPowTargetSpacing = 60;
+         consensus.fPowAllowMinDifficultyBlocks = false;
+         consensus.enforce_BIP94 = false;
+         consensus.fPowNoRetargeting = false;
+@@ -106,87 +138,60 @@ public:
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1815; // 90%
+         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
+ 
+-        // Deployment of Taproot (BIPs 340-342)
++        // Deployment of Taproot (BIPs 340-342): active from genesis
+         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
+-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = 1619222400; // April 24th, 2021
+-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1628640000; // August 11th, 2021
+-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 709632; // Approximately November 12th, 2021
+-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = 1815; // 90%
+-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = 2016;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
++        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
+ 
+-        consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000001128750f82f4c366153a3a030"};
+-        consensus.defaultAssumeValid = uint256{"00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"}; // 938343
+-
+-        /**
+-         * The message start string is designed to be unlikely to occur in normal data.
+-         * The characters are rarely used upper ASCII, not valid as UTF-8, and produce
+-         * a large 32-bit integer with any alignment.
+-         */
+-        pchMessageStart[0] = 0xf9;
+-        pchMessageStart[1] = 0xbe;
+-        pchMessageStart[2] = 0xb4;
+-        pchMessageStart[3] = 0xd9;
+-        nDefaultPort = 8333;
++        // New chain: no minimum-work floor and nothing to assume valid yet. Bitcoin's values
++        // here would keep every node in initial block download and make it refuse the
++        // CacheCoin headers chain from peers as "too little work".
++        consensus.nMinimumChainWork = uint256{};
++        consensus.defaultAssumeValid = uint256{};
++
++        // Message start 'CCCN' (0x43 0x43 0x43 0x4e) and CacheCoin's own P2P port, so
++        // CacheCoin never speaks to (or is mistaken for) the Bitcoin network.
++        pchMessageStart[0] = 0x43;
++        pchMessageStart[1] = 0x43;
++        pchMessageStart[2] = 0x43;
++        pchMessageStart[3] = 0x4e;
++        nDefaultPort = 29333;
+         nPruneAfterHeight = 100000;
+-        m_assumed_blockchain_size = 856;
+-        m_assumed_chain_state_size = 14;
++        m_assumed_blockchain_size = 1;
++        m_assumed_chain_state_size = 1;
+ 
+-        genesis = CreateGenesisBlock(1231006505, 2083236893, 0x1d00ffff, 1, 50 * COIN);
++        const char* pszTimestamp = "CacheCoin (CCCN) - Pure CPU PoW. Open computational research under the MIT License.";
++        const CScript genesisOutputScript = CScript() << OP_RETURN << std::vector<unsigned char>(20, 0);
++        genesis = CreateCacheCoinGenesisBlock(pszTimestamp, genesisOutputScript, 1790360718, 1349294, 0x1e0ffff0, 1, 0);
+         consensus.hashGenesisBlock = genesis.GetHash();
+-        assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
+-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
++        assert(consensus.hashGenesisBlock == uint256{"1bc3387d50988b4b653389516f1d2b3672cffef48f124a3b8ff7b1ac3c1e3efa"});
++        assert(genesis.hashMerkleRoot == uint256{"3c80c391de679ce4ddd9dbc11acb2020b81958a4ace7eb4209f232f4f5af5ed8"});
++
++        // No DNS seeds: CacheCoin has no domains. Nodes find each other through
++        // -seednode / -addnode (clearnet IP or .onion) set in cachecoin.conf; community
++        // seed nodes can be hard-coded into vFixedSeeds in a later release.
++        vSeeds.clear();
++
++        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,28);  // P2PKH start with 'C'
++        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,88);  // P2SH start with 'c'
++        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,156); // WIF format compatible with keygen.py
++        base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0xCC, 0x8B, 0x2E};
++        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0xCC, 0xA9, 0x7B};
+ 
+-        // Note that of those which support the service bits prefix, most only support a subset of
+-        // possible options.
+-        // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
+-        // service bits we want, but we should get them updated to support all service bits wanted by any
+-        // release ASAP to avoid it where possible.
+-        vSeeds.emplace_back("seed.bitcoin.sipa.be."); // Pieter Wuille, only supports x1, x5, x9, and xd
+-        vSeeds.emplace_back("dnsseed.bluematt.me."); // Matt Corallo, only supports x9
+-        vSeeds.emplace_back("seed.bitcoin.jonasschnelli.ch."); // Jonas Schnelli, only supports x1, x5, x9, and xd
+-        vSeeds.emplace_back("seed.btc.petertodd.net."); // Peter Todd, only supports x1, x5, x9, and xd
+-        vSeeds.emplace_back("seed.bitcoin.sprovoost.nl."); // Sjors Provoost
+-        vSeeds.emplace_back("dnsseed.emzy.de."); // Stephan Oeste
+-        vSeeds.emplace_back("seed.bitcoin.wiz.biz."); // Jason Maurice
+-        vSeeds.emplace_back("seed.mainnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+-
+-        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
+-        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,5);
+-        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,128);
+-        base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
+-        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
+-
+-        bech32_hrp = "bc";
+-
+-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_main), std::end(chainparams_seed_main));
++        bech32_hrp = "cccn";
++
++        // Bitcoin's hard-coded mainnet peers must not be used.
++        vFixedSeeds.clear();
+ 
+         fDefaultConsistencyChecks = false;
+         m_is_mockable_chain = false;
+ 
+-        m_assumeutxo_data = {
++        // Genesis checkpoint:
++        // Height 0: CacheCoin Genesis Block
++        checkpointData = {
+             {
+-                .height = 840'000,
+-                .hash_serialized = AssumeutxoHash{uint256{"a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"}},
+-                .m_chain_tx_count = 991032194,
+-                .blockhash = uint256{"0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"},
+-            },
+-            {
+-                .height = 880'000,
+-                .hash_serialized = AssumeutxoHash{uint256{"dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"}},
+-                .m_chain_tx_count = 1145604538,
+-                .blockhash = uint256{"000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"},
+-            },
+-            {
+-                .height = 910'000,
+-                .hash_serialized = AssumeutxoHash{uint256{"4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"}},
+-                .m_chain_tx_count = 1226586151,
+-                .blockhash = uint256{"0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"},
+-            },
+-            {
+-                .height = 935'000,
+-                .hash_serialized = AssumeutxoHash{uint256{"e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"}},
+-                .m_chain_tx_count = 1305397408,
+-                .blockhash = uint256{"0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"},
++                { 0, uint256{"1bc3387d50988b4b653389516f1d2b3672cffef48f124a3b8ff7b1ac3c1e3efa"}},
+             }
+         };
+ 
+@@ -197,10 +202,11 @@ public:
+             .dTxRate  = 5.40111006496122,
+         };
+ 
+-        // Generated by headerssync-params.py on 2026-02-25.
+-        m_headers_sync_params = HeadersSyncParams{
+-            .commitment_period = 641,
+-            .redownload_buffer_size = 15218, // 15218/641 = ~23.7 commitments
++        // No history yet (Bitcoin's figures would make verificationprogress report ~0%).
++        chainTxData = ChainTxData{
++            .nTime    = 0,
++            .nTxCount = 0,
++            .dTxRate  = 0,
+         };
+     }
+ };
+@@ -226,7 +232,7 @@ public:
+         consensus.MinBIP9WarningHeight = 836640; // segwit activation height + miner confirmation window
+         consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
+-        consensus.nPowTargetSpacing = 10 * 60;
++        consensus.nPowTargetSpacing = 60;
+         consensus.fPowAllowMinDifficultyBlocks = true;
+         consensus.enforce_BIP94 = false;
+         consensus.fPowNoRetargeting = false;
+@@ -248,11 +254,12 @@ public:
+         consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000017dde1c649f3708d14b6"};
+         consensus.defaultAssumeValid = uint256{"000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"}; // 4842348
+ 
+-        pchMessageStart[0] = 0x0b;
+-        pchMessageStart[1] = 0x11;
+-        pchMessageStart[2] = 0x09;
+-        pchMessageStart[3] = 0x07;
+-        nDefaultPort = 18333;
++        // Magic Bytes: 'T', 'C', 'C', 'N' (0x54, 0x43, 0x43, 0x4e)
++        pchMessageStart[0] = 0x54;
++        pchMessageStart[1] = 0x43;
++        pchMessageStart[2] = 0x43;
++        pchMessageStart[3] = 0x4e;
++        nDefaultPort = 39333;
+         nPruneAfterHeight = 1000;
+         m_assumed_blockchain_size = 245;
+         m_assumed_chain_state_size = 19;
+@@ -262,14 +269,10 @@ public:
+         assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
+         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+ 
++        // CacheCoin: testnet is disabled (SelectParams refuses it). Never contact Bitcoin's
++        // testnet seeds, even if it is re-enabled later.
+         vFixedSeeds.clear();
+         vSeeds.clear();
+-        // nodes with support for servicebits filtering should be at the top
+-        vSeeds.emplace_back("testnet-seed.bitcoin.jonasschnelli.ch.");
+-        vSeeds.emplace_back("seed.tbtc.petertodd.net.");
+-        vSeeds.emplace_back("seed.testnet.bitcoin.sprovoost.nl.");
+-        vSeeds.emplace_back("testnet-seed.bluematt.me."); // Just a static list of stable node(s), only supports x9
+-        vSeeds.emplace_back("seed.testnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+ 
+         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
+         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
+@@ -277,9 +280,7 @@ public:
+         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
+         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+ 
+-        bech32_hrp = "tb";
+-
+-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_test), std::end(chainparams_seed_test));
++        bech32_hrp = "tccn";
+ 
+         fDefaultConsistencyChecks = false;
+         m_is_mockable_chain = false;
+@@ -439,15 +440,13 @@ public:
+         vSeeds.clear();
+ 
+         if (!options.challenge) {
+-            bin = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"_hex_v_u8;
+-            vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_signet), std::end(chainparams_seed_signet));
+-            vSeeds.emplace_back("seed.signet.bitcoin.sprovoost.nl.");
+-            vSeeds.emplace_back("seed.signet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+-
+-            consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000b463ea0a4b8"};
+-            consensus.defaultAssumeValid = uint256{"00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"}; // 293175
+-            m_assumed_blockchain_size = 24;
+-            m_assumed_chain_state_size = 4;
++            bin = ParseHex("512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae");
++            // CacheCoin: signet is disabled (SelectParams refuses it); no Bitcoin signet seeds.
++
++            consensus.nMinimumChainWork = uint256{"000000000000000000000000000000000000000000000000000001ad46be4862"};
++            consensus.defaultAssumeValid = uint256{"0000013d778ba3f914530f11f6b69869c9fab54acff85acd7b8201d111f19b7f"}; // 150000
++            m_assumed_blockchain_size = 1;
++            m_assumed_chain_state_size = 0;
+             chainTxData = ChainTxData{
+                 // Data from RPC: getchaintxstats 4096 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
+                 .nTime    = 1772055248,
+@@ -483,7 +482,7 @@ public:
+         consensus.CSVHeight = 1;
+         consensus.SegwitHeight = 1;
+         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
+-        consensus.nPowTargetSpacing = 10 * 60;
++        consensus.nPowTargetSpacing = 60;
+         consensus.fPowAllowMinDifficultyBlocks = false;
+         consensus.enforce_BIP94 = false;
+         consensus.fPowNoRetargeting = false;
+@@ -539,7 +538,7 @@ public:
+         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
+         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+ 
+-        bech32_hrp = "tb";
++        bech32_hrp = "tccn";
+ 
+         fDefaultConsistencyChecks = false;
+         m_is_mockable_chain = false;
+@@ -573,8 +572,8 @@ public:
+         consensus.SegwitHeight = 0; // Always active unless overridden
+         consensus.MinBIP9WarningHeight = 0;
+         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+-        consensus.nPowTargetTimespan = 24 * 60 * 60; // one day
+-        consensus.nPowTargetSpacing = 10 * 60;
++        consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
++        consensus.nPowTargetSpacing = 60;
+         consensus.fPowAllowMinDifficultyBlocks = true;
+         consensus.enforce_BIP94 = opts.enforce_bip94;
+         consensus.fPowNoRetargeting = true;
+@@ -600,7 +599,7 @@ public:
+         pchMessageStart[1] = 0xbf;
+         pchMessageStart[2] = 0xb5;
+         pchMessageStart[3] = 0xda;
+-        nDefaultPort = 18444;
++        nDefaultPort = 29444;
+         nPruneAfterHeight = opts.fastprune ? 100 : 1000;
+         m_assumed_blockchain_size = 0;
+         m_assumed_chain_state_size = 0;
+@@ -643,29 +642,15 @@ public:
+         fDefaultConsistencyChecks = true;
+         m_is_mockable_chain = true;
+ 
+-        m_assumeutxo_data = {
+-            {   // For use by unit tests
+-                .height = 110,
+-                .hash_serialized = AssumeutxoHash{uint256{"b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"}},
+-                .m_chain_tx_count = 111,
+-                .blockhash = uint256{"6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"},
+-            },
+-            {
+-                // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp
+-                .height = 200,
+-                .hash_serialized = AssumeutxoHash{uint256{"17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"}},
+-                .m_chain_tx_count = 201,
+-                .blockhash = uint256{"385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"},
+-            },
++        checkpointData = {
+             {
+-                // For use by test/functional/feature_assumeutxo.py and test/functional/tool_bitcoin_chainstate.py
+-                .height = 299,
+-                .hash_serialized = AssumeutxoHash{uint256{"d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"}},
+-                .m_chain_tx_count = 334,
+-                .blockhash = uint256{"7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"},
+-            },
++                {0, uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"}},
++            }
+         };
+ 
++        // CacheCoin: Bitcoin's regtest UTXO snapshots do not exist on this chain.
++        m_assumeutxo_data = {};
++
+         chainTxData = ChainTxData{
+             .nTime = 0,
+             .tx_count = 0,
+@@ -678,13 +663,7 @@ public:
+         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
+         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+ 
+-        bech32_hrp = "bcrt";
+-
+-        // Copied from Testnet4.
+-        m_headers_sync_params = HeadersSyncParams{
+-            .commitment_period = 275,
+-            .redownload_buffer_size = 7017, // 7017/275 = ~25.5 commitments
+-        };
++        bech32_hrp = "tccn";
+     }
+ };
+ 
+-- 
+2.53.0.windows.3
+

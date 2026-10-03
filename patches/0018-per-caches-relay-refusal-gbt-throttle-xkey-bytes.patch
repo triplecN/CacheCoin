@@ -1,0 +1,274 @@
+From 245509fbcf607804caf405d61a4ed95ff69171a6 Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 18/20] low-risk audit fixes: PER caches, relay refusal, GBT
+ throttle, xkey bytes
+
+per: a one-entry cache for the last block's ticket records and an empty-id
+cache for zero-ticket blocks, so the payout source block is not read twice
+per height and a quiet chain stops re-reading its parent for the whole replay
+window.
+
+per/net_processing: a ticket embedded by one of the last nPerTicketWindow
+blocks is refused by the relay handler from the in-memory cache only, before
+it can spend rate-limit tokens or a RandomX hash, so re-pooling recently
+embedded ids is no longer free.
+
+rpc/mining: the getblocktemplate rebuild on a PER pool change is throttled to
+once every 5 seconds, so one peer relaying cheap tickets cannot force a
+template rebuild on every call.
+
+kernel/chainparams: the mainnet extended private key version bytes change from
+0x04CCA97B to 0x05CCA97B, so xprv strings start with "2EQ" instead of "226"
+and cannot be mistaken for an xpub at a glance. No consensus effect; only
+meaningful before the first key is exported.
+
+test/fuzz: a per_ticket_script target feeds arbitrary script bytes to the
+ticket parser and asserts anything accepted re-encodes to a script that parses
+back to the same id and payout. The parser is exposed as ParsePerTicketScript.
+
+Tests: all 15 regtest suites pass on the rebuilt node; per_ticket_script 200k
+runs plus the other five targets 50k runs each, no crashes.
+---
+ src/kernel/chainparams.cpp |  6 +++-
+ src/net_processing.cpp     | 12 ++++++++
+ src/per.cpp                | 59 ++++++++++++++++++++++++++++++++++++--
+ src/per.h                  | 11 +++++++
+ src/rpc/mining.cpp         |  8 +++++-
+ src/test/fuzz/per.cpp      | 19 ++++++++++++
+ 6 files changed, 111 insertions(+), 4 deletions(-)
+
+diff --git a/src/kernel/chainparams.cpp b/src/kernel/chainparams.cpp
+index a60e2a4..e532792 100644
+--- a/src/kernel/chainparams.cpp
++++ b/src/kernel/chainparams.cpp
+@@ -182,8 +182,12 @@ public:
+         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,28);  // P2PKH start with 'C'
+         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,88);  // P2SH start with 'c'
+         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,156); // WIF format compatible with keygen.py
++        // Distinct first characters for public and private extended keys ("226..."
++        // and "2EQ..."): with the old secret bytes both started with "226" and were
++        // 112 characters, so an exported xprv could be mistaken for an xpub. No
++        // consensus effect; change only before any mainnet key is exported.
+         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0xCC, 0x8B, 0x2E};
+-        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0xCC, 0xA9, 0x7B};
++        base58Prefixes[EXT_SECRET_KEY] = {0x05, 0xCC, 0xA9, 0x7B};
+ 
+         bech32_hrp = "cccn";
+ 
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 4818a0f..aca7589 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -5046,6 +5046,15 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+             // this node already has stays cheap to ignore; the RandomX budget is
+             // kept for tickets that are actually new.
+             if (PerPoolHas(ticket.Id())) return;
++            // A ticket embedded by one of the last nPerTicketWindow blocks is
++            // inside its replay window and can never be embedded again before the
++            // window passes. Refusing it here stops a peer from re-filling the
++            // pool with the same recently-embedded ids at no cost to itself. The
++            // cache is in memory only, so this stays cheap under cs_main.
++            if (PerEmbeddedRecently(ticket.Id(), m_chainman.ActiveChain().Tip(),
++                                    m_chainman.GetConsensus())) {
++                return;
++            }
+             // The bucket lives on the Peer, so a new TCP connection restarts it at
+             // the cap, and the initial value has to match the cap or the first
+             // message of every connection would be charged the old, larger one.
+@@ -5121,6 +5130,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
+             const int diff2{tip->nHeight - anchorIdx->nHeight};
+             if (diff2 < 0 || diff2 >= m_chainman.GetConsensus().nPerTicketWindow) return;
+             if (PerPoolHas(ticket.Id())) return;
++            // Retest with the fresh tip: the ticket may have been embedded by a
++            // block that connected while our RandomX hash was running.
++            if (PerEmbeddedRecently(ticket.Id(), tip, m_chainman.GetConsensus())) return;
+             if (PerPoolAdd(ticket)) RelayPerTicket(ticket);
+             return;
+         }
+diff --git a/src/per.cpp b/src/per.cpp
+index cf48a59..4209e21 100644
+--- a/src/per.cpp
++++ b/src/per.cpp
+@@ -181,6 +181,13 @@ std::mutex g_embedded_mutex;
+ std::map<uint256, std::vector<uint256>> g_embedded_cache;
+ std::deque<uint256> g_embedded_order;
+ 
++// One-entry cache for the most recently read block's ticket records. The payout
++// source block is read by the template path and again by the real connect at the
++// same height, and a zero-ticket chain otherwise re-reads its parent for every
++// block. Positive reads only; a failed read is never cached.
++std::mutex g_block_tickets_mutex;
++std::optional<std::pair<uint256, std::vector<PerTicket>>> g_block_tickets_cache;
++
+ /** Ticket ids embedded by pindex's block (cached, bounded).
+  *
+  *  nullopt means the block could not be read. Callers must fail closed (real
+@@ -338,10 +345,22 @@ CTxOut PerTicketOutput(const PerTicket& ticket)
+     return CTxOut{0, spk};
+ }
+ 
++std::optional<PerTicket> ParsePerTicketScript(const CScript& spk)
++{
++    return ParseTicketFromScript(spk);
++}
++
+ std::optional<std::vector<PerTicket>> PerBlockTickets(
+     const CBlockIndex* pindex, const node::BlockManager& blockman)
+ {
+     if (!pindex) return std::nullopt;
++    const uint256 hash{pindex->GetBlockHash()};
++    {
++        std::lock_guard<std::mutex> lock{g_block_tickets_mutex};
++        if (g_block_tickets_cache && g_block_tickets_cache->first == hash) {
++            return g_block_tickets_cache->second;
++        }
++    }
+     CBlock block;
+     if (!blockman.ReadBlock(block, *pindex)) return std::nullopt;
+     if (block.vtx.empty()) return std::nullopt;
+@@ -351,12 +370,20 @@ std::optional<std::vector<PerTicket>> PerBlockTickets(
+     // become payout rights one epoch later. No commitment (genesis) = no tickets.
+     size_t commit_idx{0};
+     auto per{ParsePerCommitment(cb, &commit_idx)};
+-    if (!per || commit_idx != 1) return std::vector<PerTicket>{};
++    if (!per || commit_idx != 1) {
++        std::lock_guard<std::mutex> lock{g_block_tickets_mutex};
++        g_block_tickets_cache = std::make_pair(hash, std::vector<PerTicket>{});
++        return std::vector<PerTicket>{};
++    }
+     std::vector<PerTicket> out;
+     const size_t end{std::min<size_t>(2 + per->block_tickets, cb.vout.size())};
+     for (size_t i = 2; i < end; ++i) {
+         if (auto t{ParseTicketFromScript(cb.vout[i].scriptPubKey)}) out.push_back(*t);
+     }
++    {
++        std::lock_guard<std::mutex> lock{g_block_tickets_mutex};
++        g_block_tickets_cache = std::make_pair(hash, out);
++    }
+     return out;
+ }
+ 
+@@ -772,6 +799,27 @@ bool CheckPerTicketsAndPayouts(const CBlock& block, const PerCommitment& per,
+     return true;
+ }
+ 
++bool PerEmbeddedRecently(const uint256& id, const CBlockIndex* tip,
++                         const Consensus::Params& params)
++{
++    // Cache-only on purpose: called from the P2P handler under cs_main, where a
++    // disk read of the last window of blocks per relayed ticket would stall
++    // block connect. A miss is harmless: the ticket is pooled and then rejected
++    // at connect if it is still inside the replay window (pre-fix behavior).
++    if (!tip) return false;
++    std::lock_guard<std::mutex> lock{g_embedded_mutex};
++    const CBlockIndex* a{tip};
++    for (int i = 0; i < params.nPerTicketWindow && a; ++i) {
++        auto it{g_embedded_cache.find(a->GetBlockHash())};
++        if (it != g_embedded_cache.end() &&
++            std::find(it->second.begin(), it->second.end(), id) != it->second.end()) {
++            return true;
++        }
++        a = a->pprev;
++    }
++    return false;
++}
++
+ void PerPoolDropEmbedded(const CBlock& block, const PerCommitment& per,
+                          const CBlockIndex* pindex,
+                          const node::BlockManager& blockman)
+@@ -780,7 +828,14 @@ void PerPoolDropEmbedded(const CBlock& block, const PerCommitment& per,
+     // has passed. Dropping tickets inside CheckPerTicketsAndPayouts would let a
+     // rejected block (wrong state, overpaying coinbase) remove tickets this node
+     // still holds and would never embed again.
+-    if (!pindex || per.block_tickets == 0 || block.vtx.empty()) return;
++    if (!pindex || block.vtx.empty()) return;
++    if (per.block_tickets == 0) {
++        // Cache the empty answer too: a zero-ticket chain would otherwise read its
++        // parent block again for every block of the replay window (~2 block opens
++        // per height on a quiet chain).
++        CacheEmbeddedTicketIds(pindex, {});
++        return;
++    }
+     const CTransaction& cb{*block.vtx[0]};
+     std::vector<uint256> ids;
+     ids.reserve(per.block_tickets);
+diff --git a/src/per.h b/src/per.h
+index fdc2dcd..124f4d1 100644
+--- a/src/per.h
++++ b/src/per.h
+@@ -100,6 +100,17 @@ CTxOut PerTicketOutput(const PerTicket& ticket);
+ std::optional<std::vector<PerTicket>> PerBlockTickets(
+     const CBlockIndex* pindex, const node::BlockManager& blockman);
+ 
++/** Parse one PERT coinbase output script. Same parser block validation uses;
++ *  exposed for the ticket-script fuzz target and outside callers. */
++std::optional<PerTicket> ParsePerTicketScript(const CScript& spk);
++
++/** Whether ticket id was embedded by one of the last nPerTicketWindow blocks
++ *  ending at tip, according to the in-memory cache only (no disk reads, so it
++ *  is safe to call under cs_main). A miss only means the relay handler pools a
++ *  ticket that connect will then refuse. */
++bool PerEmbeddedRecently(const uint256& id, const CBlockIndex* tip,
++                         const Consensus::Params& params);
++
+ /** Payout scripts must be spendable and small (no OP_RETURN, no bloat). */
+ bool PerPayoutScriptAllowed(const CScript& payout);
+ 
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 060c1e4..5c8b571 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -881,9 +881,14 @@ static RPCHelpMan getblocktemplate()
+     // trip the cache below. Rebuild when the pool mutates, or relayed tickets
+     // stay invisible to getblocktemplate miners until the next block/mempool tick.
+     static uint64_t nPerPoolVersionLast{0};
++    static int64_t time_pool{0};
++    // A fresh template is expensive (a full mempool scan and coinbase build), so
++    // the pool term is throttled as well: a peer that relays one cheap ticket per
++    // second would otherwise force every miner to rebuild on every call. Five
++    // seconds of staleness only delays including a just-relayed ticket.
+     if (!pindexPrev || pindexPrev->GetBlockHash() != tip ||
+         (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5) ||
+-        PerPoolVersion() != nPerPoolVersionLast)
++        (PerPoolVersion() != nPerPoolVersionLast && GetTime() - time_pool > 5))
+     {
+         // Clear pindexPrev so future calls make a new block, despite any failures from here on
+         pindexPrev = nullptr;
+@@ -891,6 +896,7 @@ static RPCHelpMan getblocktemplate()
+         // Store the pindexBest used before createNewBlock, to avoid races
+         nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
+         nPerPoolVersionLast = PerPoolVersion();
++        time_pool = GetTime();
+         CBlockIndex* pindexPrevNew = chainman.m_blockman.LookupBlockIndex(tip);
+         time_start = GetTime();
+ 
+diff --git a/src/test/fuzz/per.cpp b/src/test/fuzz/per.cpp
+index 0a5d0ed..b9aa218 100644
+--- a/src/test/fuzz/per.cpp
++++ b/src/test/fuzz/per.cpp
+@@ -152,3 +152,22 @@ FUZZ_TARGET(per_next_state)
+         assert(next.tickets == previous.tickets + tickets);
+     }
+ }
++
++FUZZ_TARGET(per_ticket_script)
++{
++    // Arbitrary script bytes as they could appear in a coinbase: the ticket
++    // parser must never crash or over-read, and anything it accepts must
++    // re-encode through PerTicketOutput to a script that parses back to the
++    // same id and payout (the round trip connect relies on).
++    const std::vector<uint8_t> bytes{buffer.begin(), buffer.end()};
++    const CScript script{bytes.begin(), bytes.end()};
++    const auto ticket{ParsePerTicketScript(script)};
++    if (!ticket) return;
++    const CTxOut out{PerTicketOutput(*ticket)};
++    assert(out.nValue == 0);
++    const auto again{ParsePerTicketScript(out.scriptPubKey)};
++    assert(again.has_value());
++    assert(again->Id() == ticket->Id());
++    assert(again->payout == ticket->payout);
++    (void)PerPayoutScriptAllowed(ticket->payout);
++}
+-- 
+2.43.0
+

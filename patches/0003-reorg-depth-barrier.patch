@@ -1,0 +1,378 @@
+From 89a3b61583c98330f97d792765a93421ca81b2ae Mon Sep 17 00:00:00 2001
+by: triplecN
+Subject: [PATCH 03/20] re-org depth barrier
+
+Refuse to switch to a branch that would undo more than MAX_REORG_DEPTH (5)
+blocks of this node's chain, unless the competing branch has run
+MAX_REORG_DEPTH + REORG_HEAL_LEAD_BLOCKS (35) blocks past the fork. The
+refusal survives restarts and is reported in getblockchaininfo.
+---
+ src/kernel/bitcoinkernel.cpp       |   2 +
+ src/kernel/bitcoinkernel.h         |   1 +
+ src/kernel/bitcoinkernel_wrapper.h |   3 +-
+ src/kernel/warning.h               |   1 +
+ src/test/fuzz/block_index_tree.cpp |   2 +-
+ src/test/util/validation.cpp       |   8 +-
+ src/test/util/validation.h         |   2 +-
+ src/validation.cpp                 | 190 +++++++++++++++++++++--------
+ src/validation.h                   |   8 +-
+ 9 files changed, 157 insertions(+), 60 deletions(-)
+
+diff --git a/src/kernel/bitcoinkernel.cpp b/src/kernel/bitcoinkernel.cpp
+index 09b4853..82b49e5 100644
+--- a/src/kernel/bitcoinkernel.cpp
++++ b/src/kernel/bitcoinkernel.cpp
+@@ -221,6 +221,8 @@ btck_Warning cast_btck_warning(kernel::Warning warning)
+         return btck_Warning_UNKNOWN_NEW_RULES_ACTIVATED;
+     case kernel::Warning::LARGE_WORK_INVALID_CHAIN:
+         return btck_Warning_LARGE_WORK_INVALID_CHAIN;
++    case kernel::Warning::REORG_DEPTH_REFUSED:
++        return btck_Warning_REORG_DEPTH_REFUSED;
+     } // no default case, so the compiler can warn about missing cases
+     assert(false);
+ }
+diff --git a/src/kernel/bitcoinkernel.h b/src/kernel/bitcoinkernel.h
+index 00bab4a..19637d2 100644
+--- a/src/kernel/bitcoinkernel.h
++++ b/src/kernel/bitcoinkernel.h
+@@ -314,6 +314,7 @@ typedef uint8_t btck_SynchronizationState;
+ typedef uint8_t btck_Warning;
+ #define btck_Warning_UNKNOWN_NEW_RULES_ACTIVATED ((btck_Warning)(0))
+ #define btck_Warning_LARGE_WORK_INVALID_CHAIN ((btck_Warning)(1))
++#define btck_Warning_REORG_DEPTH_REFUSED ((btck_Warning)(2))
+ 
+ /** Callback function types */
+ 
+diff --git a/src/kernel/bitcoinkernel_wrapper.h b/src/kernel/bitcoinkernel_wrapper.h
+index 064d0dd..f38eb0e 100644
+--- a/src/kernel/bitcoinkernel_wrapper.h
++++ b/src/kernel/bitcoinkernel_wrapper.h
+@@ -58,7 +58,8 @@ enum class SynchronizationState : btck_SynchronizationState {
+ 
+ enum class Warning : btck_Warning {
+     UNKNOWN_NEW_RULES_ACTIVATED = btck_Warning_UNKNOWN_NEW_RULES_ACTIVATED,
+-    LARGE_WORK_INVALID_CHAIN = btck_Warning_LARGE_WORK_INVALID_CHAIN
++    LARGE_WORK_INVALID_CHAIN = btck_Warning_LARGE_WORK_INVALID_CHAIN,
++    REORG_DEPTH_REFUSED = btck_Warning_REORG_DEPTH_REFUSED
+ };
+ 
+ enum class ValidationMode : btck_ValidationMode {
+diff --git a/src/kernel/warning.h b/src/kernel/warning.h
+index 453f36c..16a6b75 100644
+--- a/src/kernel/warning.h
++++ b/src/kernel/warning.h
+@@ -9,6 +9,7 @@ namespace kernel {
+ enum class Warning {
+     UNKNOWN_NEW_RULES_ACTIVATED,
+     LARGE_WORK_INVALID_CHAIN,
++    REORG_DEPTH_REFUSED,
+ };
+ } // namespace kernel
+ #endif // BITCOIN_KERNEL_WARNING_H
+diff --git a/src/test/fuzz/block_index_tree.cpp b/src/test/fuzz/block_index_tree.cpp
+index 5112a7e..0a831ad 100644
+--- a/src/test/fuzz/block_index_tree.cpp
++++ b/src/test/fuzz/block_index_tree.cpp
+@@ -97,7 +97,7 @@ FUZZ_TARGET(block_index_tree, .init = initialize_block_index_tree)
+                 CBlockIndex* old_tip = chain.Tip();
+                 assert(old_tip);
+                 do {
+-                    CBlockIndex* best_tip = chainman.FindMostWorkChain();
++                    CBlockIndex* best_tip = chainman.FindMostWorkChain(old_tip);
+                     assert(best_tip);                   // Should at least return current tip
+                     if (best_tip == chain.Tip()) break; // Nothing to do
+                     // Rewind chain to forking point
+diff --git a/src/test/util/validation.cpp b/src/test/util/validation.cpp
+index 7e09597..b079a22 100644
+--- a/src/test/util/validation.cpp
++++ b/src/test/util/validation.cpp
+@@ -75,16 +75,16 @@ void TestChainstateManager::InvalidChainFound(CBlockIndex* pindexNew)
+     static_cast<TestChainstate*>(&ActiveChainstate())->CallInvalidChainFound(pindexNew);
+ }
+ 
+-CBlockIndex* TestChainstateManager::FindMostWorkChain()
++CBlockIndex* TestChainstateManager::FindMostWorkChain(const CBlockIndex* reorg_reference)
+ {
+     struct TestChainstate : public Chainstate {
+-        CBlockIndex* CallFindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
++        CBlockIndex* CallFindMostWorkChain(const CBlockIndex* reorg_reference) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+         {
+-            return FindMostWorkChain();
++            return FindMostWorkChain(reorg_reference);
+         }
+     };
+ 
+-    return static_cast<TestChainstate*>(&ActiveChainstate())->CallFindMostWorkChain();
++    return static_cast<TestChainstate*>(&ActiveChainstate())->CallFindMostWorkChain(reorg_reference);
+ }
+ 
+ void TestChainstateManager::ResetBestInvalid()
+diff --git a/src/test/util/validation.h b/src/test/util/validation.h
+index 1be3f6a..b2a0869 100644
+--- a/src/test/util/validation.h
++++ b/src/test/util/validation.h
+@@ -27,7 +27,7 @@ struct TestChainstateManager : public ChainstateManager {
+     /** Wrappers that avoid making chainstatemanager internals public for tests */
+     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+     void InvalidChainFound(CBlockIndex* pindexNew) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+-    CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++    CBlockIndex* FindMostWorkChain(const CBlockIndex* reorg_reference) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+     void ResetBestInvalid() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ };
+ 
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 77cea63..4e539d7 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3170,67 +3170,154 @@ bool Chainstate::ConnectTip(
+     return true;
+ }
+ 
++/**
++ * CacheCoin: report in getblockchaininfo that the re-org barrier is currently refusing a
++ * competing chain that has more work, or clear that report when it is not.
++ */
++static void SetReorgRefusedWarning(ChainstateManager& chainman, bool flag)
++{
++    if (flag) {
++        chainman.GetNotifications().warningSet(
++            kernel::Warning::REORG_DEPTH_REFUSED,
++            strprintf(_("Warning: the re-org barrier is refusing a competing chain with more work (see getchaintips). "
++                        "The network may be split; this node switches once that chain leads by %d blocks of work."),
++                      REORG_HEAL_LEAD_BLOCKS));
++    } else {
++        chainman.GetNotifications().warningUnset(kernel::Warning::REORG_DEPTH_REFUSED);
++    }
++}
++
++/**
++ * CacheCoin anti-51% barrier: switching from `reference` (the tip the node had when it
++ * started choosing) to `candidate` must not disconnect more than MAX_REORG_DEPTH blocks,
++ * unless the candidate branch either
++ *  - carries more than twice the work the reference chain gained since the fork, or
++ *  - leads the reference chain by REORG_HEAL_LEAD_BLOCKS blocks of work.
++ * The second condition bounds how long honest nodes separated by a network partition
++ * can stay apart: once one side has out-mined the other by that margin, every node
++ * converges on it. Without it a hashrate split below 2:1 would never heal.
++ */
++static bool ReorgPermitted(const CBlockIndex* reference, const CBlockIndex* candidate)
++{
++    if (reference == nullptr) return true;
++    // Defensive, unreachable from FindMostWorkChain (candidates are never null
++    // and every index links back to genesis): a null here fails closed.
++    if (candidate == nullptr) return false;
++    const CBlockIndex* fork{LastCommonAncestor(reference, candidate)};
++    if (fork == nullptr) return false;
++    if (reference->nHeight - fork->nHeight <= MAX_REORG_DEPTH) return true;
++    if (candidate->nChainWork - fork->nChainWork > (reference->nChainWork - fork->nChainWork) * 2) return true;
++    return candidate->nChainWork >= reference->nChainWork + GetBlockProof(*reference) * REORG_HEAL_LEAD_BLOCKS;
++}
++
+ /**
+  * Return the tip of the chain with the most work in it, that isn't
+  * known to be invalid (it's however far from certain to be valid).
++ *
++ * CacheCoin: among those, only a chain the re-org barrier permits relative to
++ * `reorg_reference` (see ReorgPermitted). Evaluating it against the tip the caller
++ * started from, not the current tip, lets a node that hits an invalid block halfway
++ * through a permitted re-org return to where it started.
+  */
+-CBlockIndex* Chainstate::FindMostWorkChain()
++CBlockIndex* Chainstate::FindMostWorkChain(const CBlockIndex* reorg_reference)
+ {
+     AssertLockHeld(::cs_main);
++    // CacheCoin: the barrier is off while this node is still catching up with the network
++    // (still in initial block download and either no tip, or a tip older than -maxtipage)
++    // and while blocks are being loaded (import or -reindex), so a syncing node follows
++    // the most-work chain. Unlike a bare IsInitialBlockDownload() test, the block import
++    // that runs at every start-up does not count, so a branch refused before a restart
++    // stays refused.
++    const bool barrier_off{m_blockman.LoadingBlocks() ||
++        (m_chainman.IsInitialBlockDownload() &&
++         !m_chain.IsTipRecent(m_chainman.MinimumChainWork(), m_chainman.m_options.max_tip_age))};
++    if (barrier_off) reorg_reference = nullptr;
+     do {
+-        CBlockIndex *pindexNew = nullptr;
+-
+-        // Find the best candidate header.
+-        {
+-            std::set<CBlockIndex*, CBlockIndexWorkComparator>::reverse_iterator it = setBlockIndexCandidates.rbegin();
+-            if (it == setBlockIndexCandidates.rend())
+-                return nullptr;
+-            pindexNew = *it;
+-        }
+-
+-        // Check whether all blocks on the path between the currently active chain and the candidate are valid.
+-        // Just going until the active chain is an optimization, as we know all blocks in it are valid already.
+-        CBlockIndex *pindexTest = pindexNew;
+-        bool fInvalidAncestor = false;
+-        while (pindexTest && !m_chain.Contains(pindexTest)) {
+-            assert(pindexTest->HaveNumChainTxs() || pindexTest->nHeight == 0);
+-
+-            // Pruned nodes may have entries in setBlockIndexCandidates for
+-            // which block files have been deleted.  Remove those as candidates
+-            // for the most work chain if we come across them; we can't switch
+-            // to a chain unless we have all the non-active-chain parent blocks.
+-            bool fFailedChain = pindexTest->nStatus & BLOCK_FAILED_VALID;
+-            bool fMissingData = !(pindexTest->nStatus & BLOCK_HAVE_DATA);
+-            if (fFailedChain || fMissingData) {
+-                // Candidate chain is not usable (either invalid or missing data)
+-                if (fFailedChain && (m_chainman.m_best_invalid == nullptr || pindexNew->nChainWork > m_chainman.m_best_invalid->nChainWork)) {
+-                    m_chainman.m_best_invalid = pindexNew;
+-                }
+-                CBlockIndex *pindexFailed = pindexNew;
+-                // Remove the entire chain from the set.
+-                while (pindexTest != pindexFailed) {
+-                    if (fFailedChain) {
+-                        pindexFailed->nStatus |= BLOCK_FAILED_VALID;
+-                        m_blockman.m_dirty_blockindex.insert(pindexFailed);
+-                    } else if (fMissingData) {
+-                        // If we're missing data, then add back to m_blocks_unlinked,
+-                        // so that if the block arrives in the future we can try adding
+-                        // to setBlockIndexCandidates again.
+-                        m_blockman.m_blocks_unlinked.insert(
+-                            std::make_pair(pindexFailed->pprev, pindexFailed));
++        bool candidates_changed = false;
++        const CBlockIndex* best_refused{nullptr};
++        static const CBlockIndex* last_logged{nullptr};
++        // Candidates from most to least work. A candidate refused by the re-org barrier is
++        // skipped but stays in setBlockIndexCandidates (every valid block with at least the
++        // tip's work must be in that set), so it is re-evaluated whenever the chain changes.
++        for (auto it = setBlockIndexCandidates.rbegin(); it != setBlockIndexCandidates.rend(); ++it) {
++            CBlockIndex *pindexNew = *it;
++
++            // Check whether all blocks on the path between the currently active chain and the candidate are valid.
++            // Just going until the active chain is an optimization, as we know all blocks in it are valid already.
++            CBlockIndex *pindexTest = pindexNew;
++            bool fInvalidAncestor = false;
++            while (pindexTest && !m_chain.Contains(pindexTest)) {
++                assert(pindexTest->HaveNumChainTxs() || pindexTest->nHeight == 0);
++
++                // Pruned nodes may have entries in setBlockIndexCandidates for
++                // which block files have been deleted.  Remove those as candidates
++                // for the most work chain if we come across them; we can't switch
++                // to a chain unless we have all the non-active-chain parent blocks.
++                bool fFailedChain = pindexTest->nStatus & BLOCK_FAILED_VALID;
++                bool fMissingData = !(pindexTest->nStatus & BLOCK_HAVE_DATA);
++                if (fFailedChain || fMissingData) {
++                    // Candidate chain is not usable (either invalid or missing data)
++                    if (fFailedChain && (m_chainman.m_best_invalid == nullptr || pindexNew->nChainWork > m_chainman.m_best_invalid->nChainWork)) {
++                        m_chainman.m_best_invalid = pindexNew;
++                    }
++                    CBlockIndex *pindexFailed = pindexNew;
++                    // Remove the entire chain from the set.
++                    while (pindexTest != pindexFailed) {
++                        if (fFailedChain) {
++                            pindexFailed->nStatus |= BLOCK_FAILED_VALID;
++                            m_blockman.m_dirty_blockindex.insert(pindexFailed);
++                        } else if (fMissingData) {
++                            // If we're missing data, then add back to m_blocks_unlinked,
++                            // so that if the block arrives in the future we can try adding
++                            // to setBlockIndexCandidates again.
++                            m_blockman.m_blocks_unlinked.insert(
++                                std::make_pair(pindexFailed->pprev, pindexFailed));
++                        }
++                        setBlockIndexCandidates.erase(pindexFailed);
++                        pindexFailed = pindexFailed->pprev;
+                     }
+-                    setBlockIndexCandidates.erase(pindexFailed);
+-                    pindexFailed = pindexFailed->pprev;
++                    setBlockIndexCandidates.erase(pindexTest);
++                    fInvalidAncestor = true;
++                    break;
+                 }
+-                setBlockIndexCandidates.erase(pindexTest);
+-                fInvalidAncestor = true;
++                pindexTest = pindexTest->pprev;
++            }
++            if (fInvalidAncestor) {
++                // The candidate set was modified; start again from the best remaining candidate.
++                candidates_changed = true;
+                 break;
+             }
+-            pindexTest = pindexTest->pprev;
+-        }
+-        if (!fInvalidAncestor)
++            if (!ReorgPermitted(reorg_reference, pindexNew)) {
++                if (best_refused == nullptr) best_refused = pindexNew;
++                continue;
++            }
++            // Report the refusal once per best refused candidate (at most one line per block
++            // mined on the competing branch), and keep the getblockchaininfo warning current.
++            if (best_refused != nullptr && best_refused != last_logged) {
++                last_logged = best_refused;
++                const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
++                LogInfo("CacheCoin: refused re-org of %d blocks (max %d unless the other branch has more than 2x the work since the fork, "
++                        "or leads by %d blocks of work). Tip: %d, Fork: %d, Candidate: %d %s\n",
++                          reorg_reference->nHeight - fork->nHeight, MAX_REORG_DEPTH, REORG_HEAL_LEAD_BLOCKS,
++                          reorg_reference->nHeight, fork->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
++            }
++            SetReorgRefusedWarning(m_chainman, best_refused != nullptr);
+             return pindexNew;
+-    } while(true);
++        }
++        // No usable candidate this pass. When the set did not change we return nullptr, but
++        // must still mirror the once-per-candidate refusal report above; otherwise the
++        // getblockchaininfo warning goes stale when only refused chains remain.
++        if (best_refused != nullptr && best_refused != last_logged) {
++            last_logged = best_refused;
++            const CBlockIndex* fork{LastCommonAncestor(reorg_reference, best_refused)};
++            LogInfo("CacheCoin: refused re-org of %d blocks (max %d unless the other branch has more than 2x the work since the fork, "
++                    "or leads by %d blocks of work). Tip: %d, Fork: %d, Candidate: %d %s\n",
++                      reorg_reference->nHeight - fork->nHeight, MAX_REORG_DEPTH, REORG_HEAL_LEAD_BLOCKS,
++                      reorg_reference->nHeight, fork->nHeight, best_refused->nHeight, best_refused->GetBlockHash().ToString());
++        }
++        SetReorgRefusedWarning(m_chainman, best_refused != nullptr);
++        if (!candidates_changed) return nullptr;
++    } while (true);
+ }
+ 
+ /** Delete all entries in setBlockIndexCandidates that are worse than the current tip. */
+@@ -3259,6 +3346,9 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
+     const CBlockIndex* pindexOldTip = m_chain.Tip();
+     const CBlockIndex* pindexFork = m_chain.FindFork(pindexMostWork);
+ 
++    // (CacheCoin: the maximum re-org depth rule is applied when choosing the candidate,
++    // in FindMostWorkChain(), so pindexMostWork is always a permitted target here.)
++
+     // Disconnect active blocks which are no longer in the best chain.
+     bool fBlocksDisconnected = false;
+     DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_BYTES};
+@@ -3432,7 +3522,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
+                 ConnectTrace connectTrace; // Destructed before cs_main is unlocked
+ 
+                 if (pindexMostWork == nullptr) {
+-                    pindexMostWork = FindMostWorkChain();
++                    pindexMostWork = FindMostWorkChain(starting_tip);
+                 }
+ 
+                 // Whether we have anything to do at all.
+diff --git a/src/validation.h b/src/validation.h
+index 7aeaafe..e268f47 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -72,8 +72,10 @@ namespace util {
+ class SignalInterrupt;
+ } // namespace util
+ 
+-/** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */
+-static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
++/** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned.
++ *  CacheCoin: 2880 = two days of 60 s blocks (Bitcoin: 288 = two days of 10-minute blocks).
++ *  (Pruning itself is refused outright since PER needs full history; see 0011.) */
++static const unsigned int MIN_BLOCKS_TO_KEEP = 2880;
+ static const signed int DEFAULT_CHECKBLOCKS = 6;
+ static constexpr int DEFAULT_CHECKLEVEL{3};
+ // Require that user allocate at least 550 MiB for block & undo files (blk???.dat and rev???.dat)
+@@ -860,7 +862,7 @@ protected:
+         DisconnectedBlockTransactions& disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+ 
+     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+-    CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++    CBlockIndex* FindMostWorkChain(const CBlockIndex* reorg_reference) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+     bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+-- 
+2.53.0.windows.3
+
