@@ -1,0 +1,65 @@
+name: release
+
+# Triggered by a signed version tag. Builds the Linux binaries with
+# scripts/build_linux.sh, runs the 13 suites, writes SHA256SUMS.txt and creates
+# a DRAFT GitHub release. The maintainer then signs SHA256SUMS.txt offline with
+# the release GPG key, attaches the .asc, and publishes (see doc/release.md).
+# Signing does not happen in CI: the private key never leaves the maintainer.
+
+on:
+  push:
+    tags: ['v*']
+
+# Least privilege by default; only the release job may write, to create the draft.
+permissions:
+  contents: read
+
+jobs:
+  linux-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build cachecoind + cachecoin-cli
+        run: bash scripts/build_linux.sh
+      - name: Emission schedule self-check (no node needed)
+        run: python3 scripts/check_supply.py --check
+      - name: Regression suites (throw-away datadirs, never mainnet)
+        run: |
+          BIN="$(command -v cachecoind)"
+          python3 tests/functional_regtest.py "$BIN"
+          python3 tests/per_regtest.py "$BIN"
+          python3 tests/shunko_regtest.py "$BIN"
+          python3 tests/p2p_dos_regtest.py "$BIN"
+          python3 tests/explorer_regtest.py "$BIN"
+          python3 tests/mainnet_smoke.py "$BIN"
+          python3 tests/durability_regtest.py "$BIN"
+          python3 tests/per_invariants.py "$BIN"
+          python3 tests/per_adversarial_regtest.py "$BIN"
+          python3 tests/wallet_reorg_regtest.py "$BIN"
+          python3 tests/soak_regtest.py "$BIN"
+          python3 tests/swap_scripts_regtest.py "$BIN"
+          python3 tests/watcher_conformance_regtest.py "$BIN"
+          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
+      - name: Genesis reproduction
+        run: python3 scripts/reproduce_genesis.py
+      - name: Collect binaries and checksums
+        run: |
+          mkdir -p release
+          cp "$(command -v cachecoind)" release/cachecoind
+          cp "$(command -v cachecoin-cli)" release/cachecoin-cli
+          bash scripts/release_sign.sh release
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PATCHES_ID="$(cat "$HOME/cachecoin-build/cachecoin-v31.1/.cachecoin-patches")"
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "CacheCoin ${GITHUB_REF_NAME}" \
+            --notes "Draft release built by CI from tag ${GITHUB_REF_NAME}. Patch fingerprint: ${PATCHES_ID}. Verify with doc/verification.md and sha256sum -c SHA256SUMS.txt. Sign SHA256SUMS.txt offline with the release key and attach the .asc before publishing (doc/release.md). Windows binaries are not attached: the .exe files are not tested by this repository (doc/build-windows.md)." \
+            release/*

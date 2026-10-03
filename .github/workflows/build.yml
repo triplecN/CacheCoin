@@ -1,0 +1,167 @@
+name: build-and-test
+
+# The Linux job mirrors
+# scripts/build_linux.sh + tests/ one-to-one. The ARM64 job repeats the consensus
+# suites there, because RandomX has separate ARM64 code paths and consensus must
+# not depend on the architecture. The Windows job exists so newcomers can download
+# a ready .exe from Releases instead of building (see START_HERE.md). Checksums are
+# SHA-256 (never MD5: MD5 is broken for integrity purposes).
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Least privilege: this workflow only ever reads the repository. The default token
+# permissions can include contents: write, and actions/checkout leaves the token in
+# .git/config where the following build steps can read it.
+permissions:
+  contents: read
+
+# Several suites on RandomX nodes are slow. Without this, successive pushes stack runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build cachecoind + cachecoin-cli
+        run: bash scripts/build_linux.sh
+      - name: Emission schedule self-check (no node needed)
+        run: python3 scripts/check_supply.py --check
+      - name: Regression suites (throw-away datadirs, never mainnet)
+        run: |
+          BIN="$(command -v cachecoind)"
+          python3 tests/functional_regtest.py "$BIN"
+          python3 tests/per_regtest.py "$BIN"
+          python3 tests/shunko_regtest.py "$BIN"
+          python3 tests/p2p_dos_regtest.py "$BIN"
+          python3 tests/explorer_regtest.py "$BIN"
+          python3 tests/mainnet_smoke.py "$BIN"
+          python3 tests/durability_regtest.py "$BIN"
+          python3 tests/per_invariants.py "$BIN"
+          python3 tests/per_adversarial_regtest.py "$BIN"
+          python3 tests/wallet_reorg_regtest.py "$BIN"
+          python3 tests/soak_regtest.py "$BIN"
+          python3 tests/swap_scripts_regtest.py "$BIN"
+          python3 tests/watcher_conformance_regtest.py "$BIN"
+          # These two read the SOURCE TREE, not just the installed binary, so they
+          # need the path build_linux.sh cloned into (SRC_DIR).
+          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
+      - name: Genesis reproduction (no node needed)
+        run: python3 scripts/reproduce_genesis.py
+
+  linux-arm64-build-test:
+    # Cross-architecture determinism: aarch64 must reproduce the same genesis
+    # digest and accept the same chains as x86-64. build_linux.sh already runs
+    # upstream RandomX test vectors as a build gate; this repeats the consensus
+    # suites on ARM. GitHub's ARM64 runners are free for public repositories; on a
+    # private repository, drop this job or switch it to a manual trigger.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build cachecoind + cachecoin-cli (aarch64)
+        run: bash scripts/build_linux.sh
+      - name: Genesis arithmetic (Python; the node self-test runs in the suites)
+        run: python3 scripts/reproduce_genesis.py
+      - name: Consensus suites
+        run: |
+          BIN="$(command -v cachecoind)"
+          python3 tests/functional_regtest.py "$BIN"
+          python3 tests/per_regtest.py "$BIN"
+          python3 tests/per_invariants.py "$BIN"
+          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          # lwma_check.sh compiles against the source tree build_linux.sh cloned.
+          bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
+
+  windows-build:
+    # Produces cachecoind.exe + cachecoin-cli.exe for newcomers.
+    # Follows doc/build-windows.md (MSYS2/MINGW64) plus the CacheCoin steps
+    # from scripts/build_linux.sh: pin check -> apply the patch series in order ->
+    # build pinned RandomX -> build node binaries -> SHA256SUMS.
+    #
+    # Allowed to fail for now: the MSYS2/MINGW64 toolchain is the least
+    # reliable of the three jobs, and a red Windows job must not mark the
+    # whole run as failed. Remove continue-on-error once it is green.
+    continue-on-error: true
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake mingw-w64-x86_64-boost
+            mingw-w64-x86_64-libevent mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-natpmp
+            mingw-w64-x86_64-zeromq python
+      - name: Clone pinned sources
+        run: |
+          # Git for Windows defaults to core.autocrlf=true, which turns the source
+          # into CRLF on checkout; `git apply --index` then fails with "does not
+          # match index" on the first patch that touches a file. Force LF so the
+          # Windows job applies exactly the same bytes as the Linux job.
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git clone --branch v31.1 --depth 1 https://github.com/bitcoin/bitcoin.git /c/b
+          cd /c/b
+          test "$(git rev-parse 'v31.1^{commit}')" = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+          git clone https://github.com/tevador/RandomX.git src/crypto/randomx
+          git -C src/crypto/randomx checkout --quiet 7607fb2faed24d5a679e139a9828d194bbc644a4
+          test "$(git -C src/crypto/randomx rev-parse HEAD)" = "7607fb2faed24d5a679e139a9828d194bbc644a4"
+      - name: Apply CacheCoin patches in order
+        run: |
+          cd /c/b
+          for p in "$GITHUB_WORKSPACE/patches/"*.patch; do
+            echo "-> $(basename $p)"
+            git apply --index "$p"
+          done
+          if grep -rIn --exclude-dir=.git -e '^<<<<<<< ' -e '^>>>>>>> ' src/; then
+            echo "conflict markers found in the patched tree"; exit 1
+          fi
+      - name: Build RandomX + node
+        # RandomX is built out of tree first, then consumed by the node build as a
+        # prebuilt librandomx.a. RandomX's own CMakeLists installs a library and builds
+        # three executables, so it is not pulled in with add_subdirectory.
+        run: |
+          mkdir -p /c/b/src/crypto/randomx/build
+          cd /c/b/src/crypto/randomx/build
+          cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
+          make -j4
+          ./randomx-tests > randomx-tests.log && tail -1 randomx-tests.log
+          cd /c/b
+          cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
+            -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI=OFF \
+            -DBUILD_KERNEL_LIB=OFF -DBUILD_BITCOIN_BIN=OFF -DENABLE_WALLET=ON \
+            -DENABLE_IPC=OFF -DWITH_ZMQ=OFF -DWITH_USDT=OFF
+          cmake --build build -j4 --target bitcoind bitcoin-cli
+      - name: Rename, checksum, upload
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp /c/b/build/bin/bitcoind.exe "$GITHUB_WORKSPACE/release/cachecoind.exe"
+          cp /c/b/build/bin/bitcoin-cli.exe "$GITHUB_WORKSPACE/release/cachecoin-cli.exe"
+          cd "$GITHUB_WORKSPACE/release"
+          sha256sum cachecoind.exe cachecoin-cli.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cachecoin-windows
+          path: release/
