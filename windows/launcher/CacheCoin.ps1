@@ -4,7 +4,8 @@ param(
     [switch]$Silent,
     [ValidateSet('node', 'mining')][string]$Mode,
     [int]$RunSeconds = 0,
-    [switch]$Stop
+    [switch]$Stop,
+    [switch]$DisableAutostart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +43,10 @@ $script:WorkerRuns = 0
 $script:MiningNextRefill = (Get-Date)
 $script:LogWriteCount = 0
 $script:LastTipRefresh = [DateTime]::MinValue
+$script:LockStream = $null
+$script:MiningFailStreak = 0
+$script:AttachedMissCount = 0
+$script:WalletFingerprint = ''
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -183,7 +188,6 @@ function Initialize-Config {
         'onlynet'     = 'onion'
         'dnsseed'     = '0'
         'discover'    = '0'
-        'upnp'        = '0'
         'natpmp'      = '0'
         'addnode'     = $script:Seed
         'rpcbind'     = '127.0.0.1'
@@ -214,30 +218,45 @@ function Initialize-Config {
     $rawBytes = $null
     try { $rawBytes = [System.IO.File]::ReadAllBytes($script:ConfPath) } catch { Fail "Could not read $($script:ConfPath): $($_.Exception.Message)" }
     $confEncoding = [System.Text.Encoding]::Default
-    try {
-        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-        $null = $strictUtf8.GetString($rawBytes)
+    $confText = $null
+    if ($rawBytes.Length -ge 2 -and $rawBytes[0] -eq 0xFF -and $rawBytes[1] -eq 0xFE) {
+        $confText = [System.Text.Encoding]::Unicode.GetString($rawBytes, 2, $rawBytes.Length - 2)
         $confEncoding = New-Object System.Text.UTF8Encoding($false)
-    } catch { }
-    $confText = $confEncoding.GetString($rawBytes)
-    $existing = @()
+    } elseif ($rawBytes.Length -ge 2 -and $rawBytes[0] -eq 0xFE -and $rawBytes[1] -eq 0xFF) {
+        $confText = [System.Text.Encoding]::BigEndianUnicode.GetString($rawBytes, 2, $rawBytes.Length - 2)
+        $confEncoding = New-Object System.Text.UTF8Encoding($false)
+    } elseif ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+        $confText = [System.Text.Encoding]::UTF8.GetString($rawBytes, 3, $rawBytes.Length - 3)
+        $confEncoding = New-Object System.Text.UTF8Encoding($false)
+    } else {
+        try {
+            $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            $confText = $strictUtf8.GetString($rawBytes)
+            $confEncoding = New-Object System.Text.UTF8Encoding($false)
+        } catch {
+            $confText = [System.Text.Encoding]::Default.GetString($rawBytes)
+            $confEncoding = [System.Text.Encoding]::Default
+        }
+    }
+    if ($confText.Length -gt 0 -and $confText[0] -eq [char]0xFEFF) { $confText = $confText.Substring(1) }
+    $existing = New-Object System.Collections.Generic.List[string]
     $reader = New-Object System.IO.StringReader($confText)
-    while ($null -ne ($line = $reader.ReadLine())) { $existing += $line }
+    while ($null -ne ($line = $reader.ReadLine())) { $existing.Add($line) }
     $reader.Close()
     $proxyValue = [string]$required['proxy']
     $proxyChanged = $false
     $customProxy = $false
-    $proxySeen = $false
+    $localProxyEmitted = $false
     $newLines = New-Object System.Collections.Generic.List[string]
     foreach ($l in $existing) {
         if ($l -match '(?i)^\s*proxy\s*=') {
-            $proxySeen = $true
-            if ($l -match '(?i)^\s*proxy\s*=\s*127\.0\.0\.1:\d+\s*$') {
-                if ($l.Trim() -ne "proxy=$proxyValue") {
+            if ($l -match '(?i)^\s*proxy\s*=\s*127\.0\.0\.1:\d+\s*(#.*)?$') {
+                if (-not $localProxyEmitted) {
                     $newLines.Add("proxy=$proxyValue")
-                    $proxyChanged = $true
+                    $localProxyEmitted = $true
+                    if ($l.Trim() -ne "proxy=$proxyValue") { $proxyChanged = $true }
                 } else {
-                    $newLines.Add($l)
+                    $proxyChanged = $true
                 }
             } else {
                 $customProxy = $true
@@ -247,6 +266,7 @@ function Initialize-Config {
         }
         $newLines.Add($l)
     }
+    $proxySeen = $localProxyEmitted -or $customProxy
     $missing = @()
     foreach ($k in $required.Keys) {
         if ($k -eq 'proxy' -and $proxySeen) { continue }
@@ -257,7 +277,17 @@ function Initialize-Config {
         if (-not $found) { $missing += $k }
     }
     if ($missing.Count -gt 0) {
-        foreach ($k in $missing) { $newLines.Add("$k=$($required[$k])") }
+        $insertAt = -1
+        for ($i = 0; $i -lt $newLines.Count; $i++) {
+            if ($newLines[$i] -match '^\s*\[') { $insertAt = $i; break }
+        }
+        if ($insertAt -ge 0) {
+            for ($j = $missing.Count - 1; $j -ge 0; $j--) {
+                $newLines.Insert($insertAt, "$($missing[$j])=$($required[$missing[$j]])")
+            }
+        } else {
+            foreach ($k in $missing) { $newLines.Add("$k=$($required[$k])") }
+        }
     }
     if ($missing.Count -gt 0 -or $proxyChanged) {
         try { [System.IO.File]::WriteAllLines($script:ConfPath, $newLines.ToArray(), $confEncoding) }
@@ -273,7 +303,7 @@ function Initialize-Config {
 function Invoke-Rpc {
     param([string[]]$RpcArgs)
     try {
-        $out = & $script:Cli "-datadir=$($script:DataDir)" @RpcArgs 2>&1
+        $out = & $script:Cli "-datadir=$($script:DataDir)" '-rpcclienttimeout=10' @RpcArgs 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
         return ($out | Out-String).Trim()
     } catch {
@@ -302,12 +332,15 @@ function Start-Node {
     if (-not (Test-Path -LiteralPath $script:Cli)) { Fail 'bin\cachecoin-cli.exe is missing. Download the package again.' }
     if (Invoke-Rpc @('getblockcount')) {
         Write-Log 'A CacheCoin node is already running; attaching to it.'
+        $script:NodeProcess = $null
         $script:AttachedToExisting = $true
         return
     }
     $existing = @(Get-DatadirProcesses -Name 'cachecoind.exe')
     if ($existing.Count -gt 0) {
         Write-Log 'A cachecoind process for this data directory already exists but is not answering RPC yet; waiting for it instead of starting a second one.'
+        $script:NodeProcess = $null
+        $script:AttachedToExisting = $true
         return
     }
     Write-Log 'Starting the node...'
@@ -401,7 +434,7 @@ function Get-MiningWorkerCount {
 function Start-MiningWorker {
     $job = Start-Job -ScriptBlock {
         param($CliPath, $DataDir, $Addr)
-        $out = & $CliPath "-datadir=$DataDir" '-rpcwallet=main' '-rpcclienttimeout=0' 'generatetoaddress' '1' $Addr 2>&1
+        $out = & $CliPath "-datadir=$DataDir" '-rpcwallet=main' '-rpcclienttimeout=0' 'generatetoaddress' '1' $Addr '500' 2>&1
         [pscustomobject]@{ Output = (($out | Out-String).Trim()); ExitCode = $LASTEXITCODE }
     } -ArgumentList $script:Cli, $script:DataDir, $script:Address
     $script:MiningJobs += $job
@@ -442,27 +475,42 @@ function Update-Mining {
         Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
         $script:MiningJobs = @($script:MiningJobs | Where-Object { $_.Id -ne $j.Id })
         $script:WorkerRuns++
+        $isNormalTimeout = $false
+        if ($result -and $result.Output -match '(?i)Failed to make block') { $isNormalTimeout = $true }
         if ($result -and $result.ExitCode -eq 0 -and $result.Output -match '[0-9a-f]{64}') {
             $script:FoundBlocks++
+            $script:MiningFailStreak = 0
             $height = 0
             $h = Invoke-Rpc @('getblockcount')
             if ($h) { try { $height = [int]$h } catch { } }
             $reward = 5
             if ($height -gt 720) { $reward = 10 }
-            Write-Log ('Block found! +{0} CCCN at height {1}. Spendable after 100 more blocks.' -f $reward, $height)
+            if ($height -gt 0) {
+                Write-Log ('Block found! +{0} CCCN at height {1}. Spendable after 100 more blocks.' -f $reward, $height)
+            } else {
+                Write-Log ('Block found! +{0} CCCN. Spendable after 100 more blocks.' -f $reward)
+            }
+        } elseif ($isNormalTimeout -or ($result -and $result.ExitCode -eq 0)) {
+            $script:MiningFailStreak = 0
         } elseif ($result -and $result.ExitCode -ne 0) {
+            $script:MiningFailStreak++
             if (-not $script:LastMiningErrorLog -or ((Get-Date) - $script:LastMiningErrorLog).TotalSeconds -ge 60) {
                 $firstLine = ($result.Output -split "`r?`n")[0]
                 Write-Log "A mining worker returned an error and will be retried: $firstLine" 'WARN'
                 $script:LastMiningErrorLog = Get-Date
             }
-            $script:MiningNextRefill = (Get-Date).AddSeconds(5)
         } else {
+            $script:MiningFailStreak++
             if (-not $script:LastMiningErrorLog -or ((Get-Date) - $script:LastMiningErrorLog).TotalSeconds -ge 60) {
                 Write-Log 'A mining worker ended without a result (it may have been killed); it will be retried.' 'WARN'
                 $script:LastMiningErrorLog = Get-Date
             }
-            $script:MiningNextRefill = (Get-Date).AddSeconds(5)
+        }
+        if ($script:MiningFailStreak -gt 0) {
+            $backoff = [Math]::Min(60, 5 * [Math]::Pow(2, [Math]::Min(4, $script:MiningFailStreak - 1)))
+            $script:MiningNextRefill = (Get-Date).AddSeconds($backoff)
+        } else {
+            $script:MiningNextRefill = (Get-Date).AddSeconds(2)
         }
     }
     $target = Get-MiningWorkerCount
@@ -475,6 +523,8 @@ function Update-MiningGate {
     $reason = ''
     if (-not $st.Running) {
         $reason = 'The node is not answering; mining is paused until it is back.'
+    } elseif ($st.IBD -and $st.Headers -gt 0) {
+        $reason = 'The node is still syncing; mining will start when it is up to date.'
     } elseif ($st.Peers -eq 0) {
         $reason = 'No peers yet; mining will resume when the node connects.'
     } elseif ($script:LastTipTime -gt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 300)) {
@@ -514,23 +564,40 @@ function Get-OrCreateWallet {
     return 'failed'
 }
 
+function Test-DatadirCommandLine {
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return $false }
+    $m = [regex]::Match($CommandLine, '(?i)-datadir=(?:"([^"]*)"|(\S+))')
+    if (-not $m.Success) { return $false }
+    $arg = $m.Groups[1].Value
+    if (-not $arg) { $arg = $m.Groups[2].Value }
+    try { $arg = [System.IO.Path]::GetFullPath($arg) } catch { return $false }
+    return ($arg.TrimEnd('\') -ieq $script:DataDir.TrimEnd('\'))
+}
+
 function Get-DatadirProcesses {
-    param([string]$Name)
+    param([string]$Name, [switch]$OnlyMining)
     try {
-        Get-CimInstance Win32_Process -Filter "Name='$Name'" -ErrorAction Stop |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$($script:DataDir)*" }
+        $procs = Get-CimInstance Win32_Process -Filter "Name='$Name'" -ErrorAction Stop
     } catch {
-        @()
+        Write-Log "Could not list processes named $Name : $($_.Exception.Message)" 'WARN'
+        return @()
+    }
+    $procs | Where-Object {
+        $cl = $_.CommandLine
+        if (-not (Test-DatadirCommandLine -CommandLine $cl)) { return $false }
+        if ($OnlyMining -and ($cl -notmatch '(?i)generatetoaddress')) { return $false }
+        return $true
     }
 }
 
 function Stop-StaleMiningProcesses {
-    $stale = @(Get-DatadirProcesses -Name 'cachecoin-cli.exe')
+    $stale = @(Get-DatadirProcesses -Name 'cachecoin-cli.exe' -OnlyMining)
     foreach ($p in $stale) {
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
     }
     if ($stale.Count -gt 0) {
-        Write-Log "Cleaned up $($stale.Count) mining process(es) left behind by a previous run." 'WARN'
+        Write-Log "Cleaned up $($stale.Count) leftover mining process(es) from a previous run." 'WARN'
     }
 }
 
@@ -538,6 +605,39 @@ function Get-MiningAddress {
     $addr = Invoke-Rpc @('-rpcwallet=main', 'getnewaddress')
     if (-not $addr) { return '' }
     return $addr.Trim()
+}
+
+function Get-WalletFingerprint {
+    $d = Invoke-Rpc @('-rpcwallet=main', 'listdescriptors')
+    if (-not $d) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($d.Trim()))
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Test-AddressOwned {
+    param([string]$Address)
+    if (-not $Address) { return $false }
+    $info = Invoke-Rpc @('-rpcwallet=main', 'getaddressinfo', $Address)
+    if (-not $info) { return $false }
+    try { return [bool](($info | ConvertFrom-Json).ismine) } catch { return $false }
+}
+
+function Save-State {
+    param([string]$Mode)
+    try {
+        ([ordered]@{
+            mode              = $Mode
+            backupConfirmed   = $script:BackupConfirmed
+            miningAddress     = $script:Address
+            walletFingerprint = $script:WalletFingerprint
+            version           = 1
+        } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:StateFile -Encoding UTF8
+    } catch { }
 }
 
 function Invoke-BackupGate {
@@ -591,6 +691,22 @@ function Invoke-BackupGate {
         Write-Host 'The backup files could not be read back after writing; the backup is not confirmed.'
         return $false
     }
+    try {
+        $bakInfo = Get-Item -LiteralPath $walletBak -ErrorAction Stop
+        if ($bakInfo.Length -lt 1024) {
+            Write-Host 'The wallet backup file looks too small; the backup is not confirmed.'
+            return $false
+        }
+        $descObj = [System.IO.File]::ReadAllText($descFile) | ConvertFrom-Json
+        if (-not $descObj.descriptors -or @($descObj.descriptors).Count -lt 1) {
+            Write-Host 'The descriptor export looks empty; the backup is not confirmed.'
+            return $false
+        }
+    } catch {
+        Write-Host 'The backup files could not be validated; the backup is not confirmed.'
+        return $false
+    }
+    Write-Log "Wallet backup saved: $walletBak (sha256 $h1), descriptors: $descFile (sha256 $h2)."
     Write-Host ''
     Write-Host "Saved: $walletBak"
     Write-Host "SHA-256: $h1"
@@ -620,17 +736,17 @@ function Write-State {
 
 function Enable-Autostart {
     try {
-        $cmd = Join-Path $script:Root 'CacheCoin.cmd'
-        $action = New-ScheduledTaskAction -Execute $cmd -Argument '-Silent'
-        if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) {
-            $runAs = "$env:USERDOMAIN\$env:USERNAME"
-        } else {
-            $runAs = $env:USERNAME
-        }
+        $ps1 = Join-Path $script:Root 'launcher\CacheCoin.ps1'
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ps1`" -Silent"
+        $runAs = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $runAs
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 0
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
         Register-ScheduledTask -TaskName 'CacheCoin Node' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
-        Write-Log 'Autostart enabled.'
+        if (Get-ScheduledTask -TaskName 'CacheCoin Node' -ErrorAction SilentlyContinue) {
+            Write-Log 'Autostart enabled (runs hidden at logon).'
+        } else {
+            Write-Log 'Autostart registration did not create the task.' 'ERROR'
+        }
     } catch {
         Write-Log "Could not enable autostart: $($_.Exception.Message)" 'ERROR'
     }
@@ -638,10 +754,12 @@ function Enable-Autostart {
 
 function Disable-Autostart {
     try {
-        Unregister-ScheduledTask -TaskName 'CacheCoin Node' -Confirm:$false -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'CacheCoin Node' -Confirm:$false -ErrorAction Stop
+    } catch { }
+    if (Get-ScheduledTask -TaskName 'CacheCoin Node' -ErrorAction SilentlyContinue) {
+        Write-Log 'Could not disable autostart; the task still exists. Remove "CacheCoin Node" in Task Scheduler manually.' 'ERROR'
+    } else {
         Write-Log 'Autostart disabled.'
-    } catch {
-        Write-Log "Could not disable autostart: $($_.Exception.Message)" 'ERROR'
     }
 }
 
@@ -684,12 +802,25 @@ function Initialize-Tray {
 
 if ($SelfTest) {
     Write-Host 'CacheCoin launcher'
-    Write-Host 'Usage: CacheCoin.cmd [-Silent] [-Mode node|mining] [-RunSeconds N] [-Stop]'
-    Write-Host '  -Silent      run without prompts (used by autostart)'
-    Write-Host '  -Mode        force node-only or node+mining'
-    Write-Host '  -RunSeconds  stop cleanly after N seconds (testing)'
-    Write-Host '  -Stop        stop the running node (the launcher exits when it stops)'
+    Write-Host 'Usage: CacheCoin.cmd [-Silent] [-Mode node|mining] [-RunSeconds N] [-Stop] [-DisableAutostart]'
+    Write-Host '  -Silent           run without prompts (used by autostart)'
+    Write-Host '  -Mode             force node-only or node+mining'
+    Write-Host '  -RunSeconds       stop cleanly after N seconds (testing)'
+    Write-Host '  -Stop             stop the running node (the launcher exits when it stops)'
+    Write-Host '  -DisableAutostart remove the logon task and exit'
     Write-Host 'Self-test OK.'
+    exit 0
+}
+
+if ($DisableAutostart) {
+    try {
+        Unregister-ScheduledTask -TaskName 'CacheCoin Node' -Confirm:$false -ErrorAction Stop
+    } catch { }
+    if (Get-ScheduledTask -TaskName 'CacheCoin Node' -ErrorAction SilentlyContinue) {
+        Write-Host 'Could not remove the autostart task (access denied?). Remove "CacheCoin Node" in Task Scheduler manually.'
+        exit 1
+    }
+    Write-Host 'Autostart task removed.'
     exit 0
 }
 
@@ -699,19 +830,35 @@ if ($Stop) {
         Write-Host 'cachecoin-cli.exe not found; nothing to stop.'
         exit 1
     }
-    $stopOut = $null
-    try { $stopOut = & $stopCli "-datadir=$($script:DataDir)" stop 2>&1 } catch { }
-    if ($LASTEXITCODE -eq 0) {
+    $stopDeadline = (Get-Date).AddSeconds(45)
+    $stopped = $false
+    while ((Get-Date) -lt $stopDeadline) {
+        $stopOut = $null
+        try { $stopOut = & $stopCli "-datadir=$($script:DataDir)" stop 2>&1 } catch { }
+        if ($LASTEXITCODE -eq 0) { $stopped = $true; break }
+        Start-Sleep -Seconds 3
+    }
+    if ($stopped) {
         Write-Host 'Stop requested. The node is shutting down; its launcher exits when it stops.'
         exit 0
     }
-    Write-Host 'The node is not running (or did not answer), so there was nothing to stop.'
-    exit 0
+    Write-Host 'The node did not answer a stop request (it may still be starting). Wait a minute and try again.'
+    exit 3
 }
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\CacheCoinLauncher')
 if (-not $mutex.WaitOne(0)) {
     Write-Host 'CacheCoin is already running.'
+    exit 0
+}
+
+$lockPath = Join-Path $script:DataDir 'launcher.lock'
+try {
+    if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
+    $script:LockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+} catch {
+    Write-Host 'CacheCoin is already running in another session on this computer.'
+    try { $mutex.ReleaseMutex() } catch { }
     exit 0
 }
 
@@ -771,12 +918,16 @@ try {
 
     $st = Get-Status
     if ($st.Peers -eq 0) {
-        Write-Host 'Waiting for peers over Tor (this can take a few minutes)...'
+        if (-not $Silent) { Write-Host 'Waiting for peers over Tor (this can take a few minutes)...' }
         $deadline = (Get-Date).AddMinutes(5)
         while ((Get-Date) -lt $deadline -and -not $script:StopRequested) {
             Start-Sleep -Seconds 5
             $st = Get-Status
             if ($st.Peers -gt 0) { break }
+            if (-not $st.Running) {
+                Write-Log 'The node is not answering.' 'WARN'
+                break
+            }
         }
     }
 
@@ -788,10 +939,19 @@ try {
         if ($walletState -eq 'failed') {
             Fail 'Could not open or create the wallet. If you have a backup, restore it before mining.'
         }
+        $script:WalletFingerprint = Get-WalletFingerprint
         if ($walletState -eq 'created') {
             $script:BackupConfirmed = $false
             $script:Address = ''
             Write-Log 'A new wallet was created; the previous backup does not cover it. A new backup is required before mining.' 'WARN'
+        } elseif ($state -and $state.walletFingerprint -and $script:WalletFingerprint -and ([string]$state.walletFingerprint -ne $script:WalletFingerprint)) {
+            $script:BackupConfirmed = $false
+            $script:Address = ''
+            Write-Log 'The wallet on disk is not the one that was backed up; a new backup is required before mining.' 'WARN'
+        }
+        if ($script:Address -and -not (Test-AddressOwned -Address $script:Address)) {
+            Write-Log 'The saved mining address does not belong to the loaded wallet; a new address will be used.' 'WARN'
+            $script:Address = ''
         }
         if (-not $script:Address) {
             $script:Address = Get-MiningAddress
@@ -817,23 +977,25 @@ try {
         if ($a -match '^[Yy]') { Enable-Autostart } else { Disable-Autostart }
     }
 
-    Write-State ([ordered]@{ mode = $chosen; backupConfirmed = $script:BackupConfirmed; miningAddress = $script:Address; version = 1 })
+    Save-State -Mode $chosen
 
     $interactive = -not $Silent
     if ($interactive) {
         if (-not (Initialize-Tray)) { $interactive = $false }
     }
 
-    Write-Host ''
-    Write-Host 'CacheCoin is running.'
-    Write-Host "Data folder: $($script:DataDir)"
-    Write-Host "Log file:    $($script:LogFile)"
-    if ($interactive) {
-        Write-Host 'Use the tray icon to pause mining or stop. Closing this window stops the launcher.'
+    if (-not $Silent) {
+        Write-Host ''
+        Write-Host 'CacheCoin is running.'
+        Write-Host "Data folder: $($script:DataDir)"
+        Write-Host "Log file:    $($script:LogFile)"
+        if ($interactive) {
+            Write-Host 'Use the tray icon to pause mining or stop. Closing this window stops the launcher; the node keeps running.'
+        }
+        Write-Host ''
     } else {
-        Write-Host 'Running silently (autostart).'
+        Write-Log 'CacheCoin is running silently (autostart).'
     }
-    Write-Host ''
 
     $lastStatus = (Get-Date).AddSeconds(-15)
     $lastGate = (Get-Date).AddSeconds(-5)
@@ -844,11 +1006,30 @@ try {
     while (-not $script:StopRequested) {
         if ($deadline -and (Get-Date) -ge $deadline) { break }
         if ($script:Tray) { [System.Windows.Forms.Application]::DoEvents() }
-        if (((Get-Date) - $lastGate).TotalSeconds -ge 5) { Update-MiningGate; $lastGate = Get-Date }
+        if (((Get-Date) - $lastGate).TotalSeconds -ge 5) {
+            Update-MiningGate
+            $lastGate = Get-Date
+            if ($script:AttachedToExisting -and -not $script:NodeProcess) {
+                $attachedStatus = Get-Status
+                if ($attachedStatus.Running) {
+                    $script:AttachedMissCount = 0
+                } else {
+                    $script:AttachedMissCount++
+                    if ($script:AttachedMissCount -ge 6) {
+                        Write-Log 'The pre-existing node is not answering; the launcher is exiting.'
+                        $script:StopRequested = $true
+                    }
+                }
+            }
+        }
         Update-Mining
         if (((Get-Date) - $lastStatus).TotalSeconds -ge 15) {
             $st = Get-Status
-            Write-StatusLine -Status $st
+            if (-not $Silent) {
+                Write-StatusLine -Status $st
+            } else {
+                Write-Log ('Status: peers={0} height={1} ibd={2} mining={3}' -f $st.Peers, $st.Height, $st.IBD, $script:Mining)
+            }
             $lastStatus = Get-Date
             if ($script:Tray) {
                 $tip = "CacheCoin - $($st.Peers) peers, block $($st.Height)"
@@ -881,10 +1062,17 @@ try {
                             Stop-Mining
                             $script:BackupConfirmed = $false
                             $script:Address = ''
+                            $script:WalletFingerprint = Get-WalletFingerprint
                             Write-Log 'The wallet was missing after the restart and a new one was created; mining is paused and a new backup is required.' 'WARN'
-                        } elseif (-not $script:Address) {
-                            $script:Address = Get-MiningAddress
+                        } else {
+                            $script:WalletFingerprint = Get-WalletFingerprint
+                            if ($script:Address -and -not (Test-AddressOwned -Address $script:Address)) {
+                                $script:Address = ''
+                                Write-Log 'The saved mining address does not belong to the reopened wallet; a new address will be used.' 'WARN'
+                            }
+                            if (-not $script:Address) { $script:Address = Get-MiningAddress }
                         }
+                        Save-State -Mode $chosen
                     }
                 } else {
                     Write-Log 'The node keeps stopping; giving up. See the log.' 'ERROR'
@@ -895,9 +1083,9 @@ try {
         if ($interactive) { Start-Sleep -Seconds 2 } else { Start-Sleep -Seconds 3 }
     }
 } finally {
+    try { Stop-Mining } catch { }
+    try { Stop-StaleMiningProcesses } catch { }
     try {
-        Stop-Mining
-        Stop-StaleMiningProcesses
         if ($script:NodeStartedByUs -and $script:NodeProcess -and -not $script:NodeProcess.HasExited) {
             Write-Log 'Stopping the node...'
             Invoke-Rpc @('stop') | Out-Null
@@ -907,14 +1095,24 @@ try {
         } elseif ($script:AttachedToExisting) {
             Write-Log 'Leaving the pre-existing node running.'
         }
+    } catch { }
+    try {
         if ($script:StartedTor -and $script:TorProcess -and -not $script:TorProcess.HasExited) {
             Stop-Process -Id $script:TorProcess.Id -Force -ErrorAction SilentlyContinue
         }
+    } catch { }
+    try {
         if ($script:Tray) {
             $script:Tray.Visible = $false
             $script:Tray.Dispose()
         }
     } catch { }
+    try {
+        if ($script:LockStream) {
+            $script:LockStream.Dispose()
+            $script:LockStream = $null
+        }
+    } catch { }
     try { $mutex.ReleaseMutex() } catch { }
-    Write-Log 'Launcher stopped. Your coins are safe.'
+    try { Write-Log 'Launcher stopped.' } catch { }
 }

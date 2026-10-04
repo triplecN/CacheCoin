@@ -12,11 +12,14 @@ and optionally mines on your CPU.
 5. To stop: right-click the tray icon and choose "Stop CacheCoin". Prefer the
    tray button; closing the window can leave the node running in the
    background (the next start attaches to it).
-6. If the node runs automatically at login (no window, no tray), stop it with:
-   CacheCoin.cmd -Stop
+6. If the node runs automatically at login (hidden: no window, no tray), stop
+   it with: CacheCoin.cmd -Stop
+   To stop it starting at login at all: CacheCoin.cmd -DisableAutostart
 7. Never delete the data folder while the node is running.
 8. Mining starts only after you save and confirm a backup (see BACKUP.txt).
    Until then, an automatic start keeps the node running but does not mine.
+   The wallet is checked before mining; if it changed or the backup does not
+   cover it, mining waits for a new backup.
 
 Tor is required. If Tor is not already running, the bundled copy starts
 automatically. If mining, you MUST save a backup first; see docs\BACKUP.txt.

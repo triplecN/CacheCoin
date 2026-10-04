@@ -188,8 +188,9 @@ describes the proposed change and how to keep that default honest.
 - **Miners.** No XMRig or any other external miner. The node's built-in
   `generatetoaddress` is light mode only; faster miners have their own licenses
   and are not distributed here.
-- **Tor Browser.** Only the Expert Bundle daemon is included. Tor Browser
-  listens on 9150; the shipped configuration expects the bundle's 9050.
+- **Tor Browser.** Only the Expert Bundle daemon is included. The launcher
+  probes 9050 first and 9150 second, so either a system Tor or a Tor Browser
+  session can be used; when it starts the bundled Tor it uses 9050.
 - **Linux binaries and the GPG key.** The `.exe` files are unsigned; expect the
   SmartScreen "Windows protected your PC" prompt and verify the sha256 before
   choosing More info, then Run anyway.
