@@ -101,7 +101,7 @@ class Node:
         # -rpcdoccheck makes every RPC result in this suite prove that its keys
         # are declared in the help, so a CacheCoin RPC that grows an undeclared
         # field fails here instead of breaking tooling silently.
-        args = [BITCOIND, f"-datadir={self.datadir}", f"-rpcport={self.rpc_port}", "-listen=1", bind,
+        args = [BITCOIND, f"-datadir={self.datadir}", f"-rpcport={self.rpc_port}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1", "-listen=1", bind,
                 "-connect=0", "-dnsseed=0", "-fixedseeds=0", "-discover=0", "-natpmp=0",
                 "-listenonion=0", "-maxtipage=2000000000", "-rpcdoccheck=1", "-printtoconsole=0"]
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -114,7 +114,18 @@ class Node:
                 return
             except Exception:
                 time.sleep(0.3)
-        raise RuntimeError(f"{self.name} did not start")
+        tail = ""
+        try:
+            with open(os.path.join(self.datadir, "debug.log"), errors="replace") as f:
+                tail = f.read()[-2000:]
+        except OSError:
+            pass
+        listeners = ""
+        try:
+            listeners = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            pass
+        raise RuntimeError(f"{self.name} did not start (exit={self.proc.poll()}); debug.log tail:\n{tail}\nlisteners:\n{listeners}")
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -230,7 +241,8 @@ def main():
     finally:
         a.stop()
         b.stop()
-        shutil.rmtree(BASE, ignore_errors=True)
+        if not os.environ.get("KEEP_DATADIRS"):
+            shutil.rmtree(BASE, ignore_errors=True)
 
 
 if __name__ == "__main__":

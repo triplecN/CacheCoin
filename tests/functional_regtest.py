@@ -78,6 +78,7 @@ class Node:
         args = [
             BITCOIND, "-regtest", f"-datadir={self.datadir}",
             f"-port={self.p2p_port}", f"-rpcport={self.rpc_port}",
+            "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
             "-listen=1", "-bind=127.0.0.1", "-connect=0", "-dnsseed=0", "-fixedseeds=0",
             "-discover=0", "-natpmp=0", "-txindex=1", "-fallbackfee=0.0001",
             "-printtoconsole=0", *extra_args,

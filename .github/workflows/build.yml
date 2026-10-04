@@ -38,26 +38,40 @@ jobs:
         run: bash scripts/build_linux.sh
       - name: Emission schedule self-check (no node needed)
         run: python3 scripts/check_supply.py --check
+      - name: Reserve ephemeral ports used by the suites
+        # The suites bind fixed ports (29333/29334, 39xxx). Linux may otherwise
+        # hand the same ports to an outgoing connection as ephemeral ports,
+        # which makes a node's RPC/P2P bind fail at random.
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=29333-29334,39000-39999
       - name: Regression suites (throw-away datadirs, never mainnet)
+        env:
+          KEEP_DATADIRS: "1"
         run: |
           BIN="$(command -v cachecoind)"
-          python3 tests/functional_regtest.py "$BIN"
-          python3 tests/per_regtest.py "$BIN"
-          python3 tests/shunko_regtest.py "$BIN"
-          python3 tests/p2p_dos_regtest.py "$BIN"
-          python3 tests/explorer_regtest.py "$BIN"
-          python3 tests/mainnet_smoke.py "$BIN"
-          python3 tests/durability_regtest.py "$BIN"
-          python3 tests/per_invariants.py "$BIN"
-          python3 tests/per_adversarial_regtest.py "$BIN"
-          python3 tests/wallet_reorg_regtest.py "$BIN"
-          python3 tests/soak_regtest.py "$BIN"
-          python3 tests/swap_scripts_regtest.py "$BIN"
-          python3 tests/watcher_conformance_regtest.py "$BIN"
+          python3 -u tests/functional_regtest.py "$BIN"
+          python3 -u tests/per_regtest.py "$BIN"
+          python3 -u tests/shunko_regtest.py "$BIN"
+          python3 -u tests/p2p_dos_regtest.py "$BIN"
+          python3 -u tests/explorer_regtest.py "$BIN"
+          python3 -u tests/mainnet_smoke.py "$BIN"
+          python3 -u tests/durability_regtest.py "$BIN"
+          python3 -u tests/per_invariants.py "$BIN"
+          python3 -u tests/per_adversarial_regtest.py "$BIN"
+          python3 -u tests/wallet_reorg_regtest.py "$BIN"
+          python3 -u tests/soak_regtest.py "$BIN"
+          python3 -u tests/swap_scripts_regtest.py "$BIN"
+          python3 -u tests/watcher_conformance_regtest.py "$BIN"
           # These two read the SOURCE TREE, not just the installed binary, so they
           # need the path build_linux.sh cloned into (SRC_DIR).
-          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          python3 -u tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
           bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
+      - name: Upload test datadirs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-test-datadirs
+          path: /tmp/cachecoin-*
+          if-no-files-found: ignore
       - name: Genesis reproduction (no node needed)
         run: python3 scripts/reproduce_genesis.py
 
@@ -76,13 +90,15 @@ jobs:
         run: bash scripts/build_linux.sh
       - name: Genesis arithmetic (Python; the node self-test runs in the suites)
         run: python3 scripts/reproduce_genesis.py
+      - name: Reserve ephemeral ports used by the suites
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=29333-29334,39000-39999
       - name: Consensus suites
         run: |
           BIN="$(command -v cachecoind)"
-          python3 tests/functional_regtest.py "$BIN"
-          python3 tests/per_regtest.py "$BIN"
-          python3 tests/per_invariants.py "$BIN"
-          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          python3 -u tests/functional_regtest.py "$BIN"
+          python3 -u tests/per_regtest.py "$BIN"
+          python3 -u tests/per_invariants.py "$BIN"
+          python3 -u tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
           # lwma_check.sh compiles against the source tree build_linux.sh cloned.
           bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
 

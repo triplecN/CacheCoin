@@ -335,9 +335,9 @@ def main():
         res = a.rpc("addpeeraddress", ONION_C, c.p2p_port, False)
         check(res["success"], "addrman accepted the onion target as a known address")
         a.rpc("addnode", addr_c, "onetry")
-        wait_for(lambda: any(p["addr"] == addr_c for p in a.rpc("getpeerinfo")), 30,
+        wait_for(lambda: any(p["addr"] == addr_c and p.get("version", 0) > 0 for p in a.rpc("getpeerinfo")), 30,
                  "A connected to C through the proxy")
-        check(any(p["addr"] == addr_c for p in a.rpc("getpeerinfo")),
+        check(any(p["addr"] == addr_c and p.get("version", 0) > 0 for p in a.rpc("getpeerinfo")),
               "the sender stays connected to C while testing")
         # The same onion service on another port is the same connected peer, so
         # exclusion must compare the network address, not IP:port. With the old

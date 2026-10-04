@@ -20,23 +20,43 @@ Rules:
 - The launcher writes the backup path and both SHA-256 values into
   logs\launcher.log; use that to find which files belong to which wallet.
 - If you receive coins later, make a fresh backup. The launcher has no backup
-  button after the first confirmation; make one by hand while the node runs:
-    cachecoin-cli backupwallet "E:\cachecoin-backup\wallet.bak"
-    cachecoin-cli -rpcwallet=main listdescriptors true > "E:\cachecoin-backup\descriptors.json"
+  button after the first confirmation; make one by hand while the node runs
+  (open a Command Prompt or PowerShell in the CacheCoin folder, the folder
+  with CacheCoin.cmd, and use .\bin\cachecoin-cli.exe):
+    .\bin\cachecoin-cli.exe -rpcwallet=main backupwallet "E:\cachecoin-backup\wallet.bak"
+    $d = .\bin\cachecoin-cli.exe -rpcwallet=main listdescriptors true
+    [System.IO.File]::WriteAllText("E:\cachecoin-backup\descriptors.json", $d, (New-Object System.Text.UTF8Encoding($false)))
+  (The WriteAllText line writes plain UTF-8. Do not use ">" for this: Windows
+  PowerShell writes UTF-16 files, which the restore commands below cannot read.)
 
 RESTORE (if the wallet is lost or you move to another computer)
 ---------------------------------------------------------------
-1. Stop the node (CacheCoin.cmd -Stop) and move the old wallet folder away:
-   rename %APPDATA%\CacheCoin\wallets  (or %APPDATA%\CacheCoin\main, whichever
-   exists) to wallets.old.
-2. Start the node again, then restore:
+Run these from a Command Prompt or PowerShell opened in the CacheCoin folder.
+Use .\bin\cachecoin-cli.exe exactly as shown; a bare cachecoin-cli will not be
+found from that folder.
+
+1. Stop the node if it is running:
+     .\bin\cachecoin-cli.exe stop
+2. Move the old wallet folder away, so the restore does not hit a name clash:
+     ren "%APPDATA%\CacheCoin\wallets" wallets.old
+   If that folder does not exist, rename "%APPDATA%\CacheCoin\main" instead.
+3. Start the launcher in node-only mode. Do NOT start normal mining mode first:
+   it would create a new, empty wallet and the restore would fail.
+     CacheCoin.cmd -Mode node
+4. Wait until the node is up (the tray says Running), then restore:
    a) From the .bak file (recommended):
-        cachecoin-cli restorewallet main "E:\cachecoin-main-wallet-<date>.bak"
-   b) Or from the descriptor JSON (Windows PowerShell):
+        .\bin\cachecoin-cli.exe restorewallet main "E:\cachecoin-main-wallet-<date>.bak"
+   b) Or from the descriptor JSON (PowerShell):
+        .\bin\cachecoin-cli.exe createwallet main
+        [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false
         $j = Get-Content "E:\cachecoin-main-descriptors-<date>.json" -Raw | ConvertFrom-Json
         $d = $j.descriptors | ConvertTo-Json -Depth 10 -Compress
-        $d | cachecoin-cli -rpcwallet=main -stdin importdescriptors
-3. Wait for the rescan to finish; the balance appears in getbalances.
+        $d | .\bin\cachecoin-cli.exe -rpcwallet=main -stdin importdescriptors
+5. Wait for the rescan to finish; the balance appears in getbalances. The
+   descriptor restore rescans from the start of the chain, so it can take a
+   while on a long chain.
+6. Close the node-only launcher and start CacheCoin normally. Confirm the
+   backup when asked, and mining resumes with your restored address.
 
 Do not type the JSON as a normal command-line argument on Windows: PowerShell
 mangles the quotes. Use the -stdin form above.

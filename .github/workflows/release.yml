@@ -27,23 +27,25 @@ jobs:
         run: bash scripts/build_linux.sh
       - name: Emission schedule self-check (no node needed)
         run: python3 scripts/check_supply.py --check
+      - name: Reserve ephemeral ports used by the suites
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=29333-29334,39000-39999
       - name: Regression suites (throw-away datadirs, never mainnet)
         run: |
           BIN="$(command -v cachecoind)"
-          python3 tests/functional_regtest.py "$BIN"
-          python3 tests/per_regtest.py "$BIN"
-          python3 tests/shunko_regtest.py "$BIN"
-          python3 tests/p2p_dos_regtest.py "$BIN"
-          python3 tests/explorer_regtest.py "$BIN"
-          python3 tests/mainnet_smoke.py "$BIN"
-          python3 tests/durability_regtest.py "$BIN"
-          python3 tests/per_invariants.py "$BIN"
-          python3 tests/per_adversarial_regtest.py "$BIN"
-          python3 tests/wallet_reorg_regtest.py "$BIN"
-          python3 tests/soak_regtest.py "$BIN"
-          python3 tests/swap_scripts_regtest.py "$BIN"
-          python3 tests/watcher_conformance_regtest.py "$BIN"
-          python3 tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
+          python3 -u tests/functional_regtest.py "$BIN"
+          python3 -u tests/per_regtest.py "$BIN"
+          python3 -u tests/shunko_regtest.py "$BIN"
+          python3 -u tests/p2p_dos_regtest.py "$BIN"
+          python3 -u tests/explorer_regtest.py "$BIN"
+          python3 -u tests/mainnet_smoke.py "$BIN"
+          python3 -u tests/durability_regtest.py "$BIN"
+          python3 -u tests/per_invariants.py "$BIN"
+          python3 -u tests/per_adversarial_regtest.py "$BIN"
+          python3 -u tests/wallet_reorg_regtest.py "$BIN"
+          python3 -u tests/soak_regtest.py "$BIN"
+          python3 -u tests/swap_scripts_regtest.py "$BIN"
+          python3 -u tests/watcher_conformance_regtest.py "$BIN"
+          python3 -u tests/emission_check.py "$BIN" "$HOME/cachecoin-build/cachecoin-v31.1"
           bash tests/lwma_check.sh "$HOME/cachecoin-build/cachecoin-v31.1"
       - name: Genesis reproduction
         run: python3 scripts/reproduce_genesis.py

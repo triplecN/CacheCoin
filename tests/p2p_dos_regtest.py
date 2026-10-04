@@ -199,6 +199,7 @@ def main():
     with open(os.path.join(BASE, "cachecoin.conf"), "w") as f:
         f.write(f"rpcuser={RPC_USER}\nrpcpassword={RPC_PASS}\n")
     proc = subprocess.Popen([BITCOIND, "-regtest", f"-datadir={BASE}", f"-port={P2P_PORT}", f"-rpcport={RPC_PORT}",
+                             "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
                              "-listen=1", "-bind=127.0.0.1", "-connect=0", "-dnsseed=0", "-fixedseeds=0",
                              "-discover=0", "-natpmp=0", "-debug=net", "-printtoconsole=0"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -319,6 +320,7 @@ def main():
             f.write(f"rpcuser={RPC_USER}\nrpcpassword={RPC_PASS}\n")
         proc_b = subprocess.Popen([BITCOIND, "-regtest", f"-datadir={base_b}",
                                    f"-port={P2P_PORT + 1}", f"-rpcport={RPC_PORT + 1}",
+                                   "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
                                    "-listen=0", "-connect=0", "-dnsseed=0", "-fixedseeds=0",
                                    "-discover=0", "-natpmp=0", "-printtoconsole=0"],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

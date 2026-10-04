@@ -46,10 +46,15 @@ the same software, and the patches will not apply.
 ```bash
 cd /c/b
 # This assumes the repository is checked out at ~/Cachecoin; adjust the path otherwise.
-for p in "$HOME/Cachecoin/patches/"*.patch; do
-  echo "-> $(basename "$p")"
-  git apply --index "$p" || { echo "FAILED: $(basename "$p")"; exit 1; }
-done
+# The subshell keeps a failed "exit 1" from closing the whole interactive terminal.
+if ! ( for p in "$HOME/Cachecoin/patches/"*.patch; do
+         echo "-> $(basename "$p")"
+         git apply --index "$p" || { echo "FAILED: $(basename "$p")"; exit 1; }
+       done ); then
+  echo "The patch series did not apply cleanly. Fix this before building; do not continue."
+else
+  echo "Patch series applied."
+fi
 ```
 
 The order matters, and so does the filename glob. `patches/0001-...` has to land before
@@ -71,8 +76,12 @@ mkdir -p /c/b/src/crypto/randomx/build
 cd /c/b/src/crypto/randomx/build
 cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -j4
-./randomx-tests > randomx-tests.log || { tail -20 randomx-tests.log; exit 1; }
-tail -1 randomx-tests.log
+if ./randomx-tests > randomx-tests.log; then
+  tail -1 randomx-tests.log
+else
+  tail -20 randomx-tests.log
+  echo "RandomX self-test FAILED. Do not build the node from this tree; fix RandomX first."
+fi
 cd /c/b
 cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
     -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI=OFF \
@@ -81,10 +90,11 @@ cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
 cmake --build build -j4 --target bitcoind bitcoin-cli
 ```
 
-The `randomx-tests` line above stops the manual session if the self-test fails. The CMake
-step itself only checks that the RandomX files exist; the node runs `RandomXSelfTest()` at
-startup and refuses to run if this machine computes a different proof-of-work than the
-network expects. After the build, a quick patch check: `./build/bin/bitcoind.exe --help`
+The `randomx-tests` block above reports the failure and leaves the session open (an
+`exit 1` would close the whole MSYS2 terminal). If it printed FAILED, do not continue.
+The CMake step itself only checks that the RandomX files exist; the node runs
+`RandomXSelfTest()` at startup and refuses to run if this machine computes a different
+proof-of-work than the network expects. After the build, a quick patch check: `./build/bin/bitcoind.exe --help`
 should mention `cachecoin.conf` (an unpatched build says `bitcoin.conf`).
 
 ## 5. Collect the binaries
