@@ -2,8 +2,9 @@
 # CacheCoin (CCCN) Windows portable package builder.
 #
 # Assembles the portable package from a CI build of the node binaries and a
-# Tor Expert Bundle: bin/, tor/, launcher/, docs/, LICENSE, version.json and
-# SHA256SUMS.windows.txt, then packs it into CacheCoin-Windows-<version>.zip.
+# Tor Expert Bundle: bin/, tor/, launcher/, tools/, docs/, the entry-point .cmd
+# files, LICENSE, version.json and SHA256SUMS.windows.txt, then packs it into
+# CacheCoin-Windows-<version>.zip.
 #
 # The repository is only read. Every write goes under --out.
 #
@@ -144,6 +145,12 @@ else
 fi
 [ -f "$LAUNCHER_DIR/launcher/CacheCoin.ps1" ] || die "missing launcher: $LAUNCHER_DIR/launcher/CacheCoin.ps1"
 [ -f "$LAUNCHER_DIR/CacheCoin.cmd" ] || die "missing launcher shim: $LAUNCHER_DIR/CacheCoin.cmd"
+[ -f "$LAUNCHER_DIR/tools/CacheCoin-Keys.ps1" ] || die "missing keys tool: $LAUNCHER_DIR/tools/CacheCoin-Keys.ps1"
+[ -f "$LAUNCHER_DIR/tools/CacheCoin-Status.ps1" ] || die "missing status tool: $LAUNCHER_DIR/tools/CacheCoin-Status.ps1"
+[ -f "$LAUNCHER_DIR/Start Node.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Start Node.cmd"
+[ -f "$LAUNCHER_DIR/Start Mining.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Start Mining.cmd"
+[ -f "$LAUNCHER_DIR/Check Status.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Check Status.cmd"
+[ -f "$LAUNCHER_DIR/My Keys and Backup.cmd" ] || die "missing entry point: $LAUNCHER_DIR/My Keys and Backup.cmd"
 
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 TOR_DIR="$(cd "$TOR_DIR" && pwd)"
@@ -189,7 +196,12 @@ if [ -z "$(find "$PKG/tor" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'c
 fi
 
 cp -R -- "$LAUNCHER_DIR/launcher"/. "$PKG/launcher/"
-cp -- "$LAUNCHER_DIR/CacheCoin.cmd" "$PKG/CacheCoin.cmd"
+for f in "$LAUNCHER_DIR"/*.cmd; do
+    [ -f "$f" ] || continue
+    cp -- "$f" "$PKG/$(basename "$f")"
+done
+mkdir -p -- "$PKG/tools"
+cp -R -- "$LAUNCHER_DIR/tools"/. "$PKG/tools/"
 
 cp -R -- "$DOCS_DIR"/. "$PKG/docs/"
 for f in README.md SECURITY.md; do

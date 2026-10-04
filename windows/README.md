@@ -12,7 +12,11 @@ directory you choose (use one outside the repository).
 
 ```
 CacheCoin-Windows-<version>/
-  CacheCoin.cmd                 # double-click entry point; calls launcher\CacheCoin.ps1
+  Start Node.cmd                # entry point: run the node only (safe default)
+  Start Mining.cmd              # entry point: run the node and mine (backup first)
+  My Keys and Backup.cmd        # entry point: save a backup or show private keys
+  Check Status.cmd              # entry point: block, peers, balance
+  CacheCoin.cmd                 # the underlying shim; calls launcher\CacheCoin.ps1
   LICENSE                       # MIT, copied from the repository root
   bin\
     cachecoind.exe              # from the windows-build CI job
@@ -20,6 +24,9 @@ CacheCoin-Windows-<version>/
     *.dll                       # MinGW runtime/library DLLs the exes load
   launcher\
     CacheCoin.ps1               # launcher written for this package
+  tools\
+    CacheCoin-Keys.ps1          # script behind My Keys and Backup.cmd
+    CacheCoin-Status.ps1        # script behind Check Status.cmd
   docs\
     README.md                   # repository README
     SECURITY.md                 # repository security policy
@@ -47,8 +54,10 @@ path to the script is the same in both places.
   fallback). The script picks one automatically.
 - A repository checkout: `patches/`, `LICENSE`, `README.md` and `SECURITY.md`
   are read from it.
-- `windows\launcher\CacheCoin.ps1`, `windows\CacheCoin.cmd` and
-  `windows\docs\` (default `--launcher-dir` / `--docs-dir`).
+- `windows\launcher\CacheCoin.ps1`, `windows\CacheCoin.cmd`, the entry-point
+  `.cmd` files (`Start Node.cmd`, `Start Mining.cmd`, `My Keys and Backup.cmd`,
+  `Check Status.cmd`), `windows\tools\` and `windows\docs\`
+  (default `--launcher-dir` / `--docs-dir`).
 
 ## Step 1: get the node binaries from CI
 

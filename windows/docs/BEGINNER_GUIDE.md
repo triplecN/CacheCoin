@@ -7,6 +7,15 @@ CacheCoin (CCCN) is a small cryptocurrency that runs over Tor. The Windows
 package contains a full node, a wallet and (optionally) a miner. There is no
 company, no support line and no seed phrase. Read the safety rules below.
 
+The package has four double-click files:
+
+- `Start Node.cmd` - run the node only (safe default).
+- `Start Mining.cmd` - run the node and mine (it asks for a backup first).
+- `My Keys and Backup.cmd` - save your wallet backup or show your private keys.
+- `Check Status.cmd` - show block, peers and balance.
+
+`CacheCoin.cmd` is the classic entry point behind them; it still works.
+
 ---
 
 ## Safety rules (read this first)
@@ -45,7 +54,8 @@ does not mine and does not use much CPU.
    minute and it proves the download arrived unchanged.
 3. Right-click the ZIP, choose **Extract All**, and open the extracted folder
    `CacheCoin-Windows-<version>`. Do not run the program from inside the ZIP.
-4. Double-click **CacheCoin** (the file `CacheCoin.cmd`).
+4. Double-click **Start Node** (the file `Start Node.cmd`). If you prefer the
+   classic way, double-click `CacheCoin` and choose `1) Node only`.
 5. If Windows shows "Windows protected your PC", click **More info**, then
    **Run anyway**. (This happens because the program has no paid Windows
    signature.)
@@ -68,23 +78,22 @@ Only start mining if you understand it is a lottery. Before mining can begin,
 you must save and confirm a wallet backup (Part 3); the launcher enforces this
 on purpose, to protect your coins.
 
-1. Open PowerShell in the CacheCoin folder. (Click the folder's address bar,
-   type `powershell`, press Enter.)
-2. Type this and press Enter:
+1. Double-click **Start Mining** (the file `Start Mining.cmd`). Or open
+   PowerShell in the CacheCoin folder and run:
 
    ```
    CacheCoin.cmd -Mode mining
    ```
 
-3. The launcher loads (or creates) your wallet. You do **not** type any address:
+2. The launcher loads (or creates) your wallet. You do **not** type any address:
    the wallet automatically creates a modern SegWit address that starts with
    `cccn1q...`. Mining pays to that address.
-4. The launcher now asks you to save a backup. Follow Part 3.
-5. After the backup is confirmed, mining starts. The window shows
+3. The launcher now asks you to save a backup. Follow Part 3.
+4. After the backup is confirmed, mining starts. The window shows
    `Mining: N worker(s)`.
 
-The mode is remembered. The next time, double-clicking **CacheCoin** starts
-mining again. To go back to node-only, run `CacheCoin.cmd -Mode node` once.
+The mode is remembered. The next time, double-clicking **Start Mining** starts
+mining again. To go back to node-only, double-click **Start Node** once.
 
 If you want a fresh receive address at any time:
 
@@ -110,7 +119,9 @@ Choose a USB stick or another disk - **not** the same disk as the program.
 After saving, unplug the USB and keep it somewhere safe. Do not leave the only
 copy in a cloud-synced folder.
 
-If you receive more coins later, make a fresh backup. The exact commands are in
+If you receive more coins later, make a fresh backup. The easy way is to
+double-click **My Keys and Backup** and choose option 1; it saves the same two
+files and prints their sha256 values. The exact manual commands are in
 `docs\BACKUP.txt`, which also contains the tested restore procedure.
 
 ---
@@ -121,6 +132,13 @@ You usually do not need this. The backup files from Part 3 are enough. Read the
 warnings before you do it.
 
 **WARNING: anyone who sees these keys can take your coins. There is no undo.**
+
+The easy way: double-click **My Keys and Backup** and choose option 2. It warns
+you, asks you to turn the internet off, asks you to type a confirmation phrase,
+shows the keys, and clears the screen when you are done. It never writes the
+keys to a log file.
+
+The manual way:
 
 1. Open PowerShell in the CacheCoin folder.
 2. Run:
@@ -149,6 +167,7 @@ backup and keys, the coins are gone. Test your restore on a second computer
 
 The Windows package has no built-in web page. The quick checks are:
 
+- **Check Status.cmd**: double-click it. It shows the block, peers and balance.
 - **Tray icon** (bottom-right of Windows): hover it. The tooltip shows
   `CacheCoin - N peers, block H`. Right-click it to pause mining or stop.
 - **Launcher log:** `%APPDATA%\CacheCoin\logs\launcher.log`.

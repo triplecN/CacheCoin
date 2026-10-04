@@ -7,9 +7,16 @@ step-by-step instructions in plain English, including backups and private keys.
 CacheCoin is a small, Tor-only cryptocurrency. This folder runs a full node,
 and optionally mines on your CPU.
 
-1. Double-click CacheCoin.cmd
-2. Choose "Node only" unless you want to mine. Mining is a lottery: you may
-   find a block, you may not. There is no guaranteed reward.
+The four double-click files:
+  Start Node.cmd           run the node only (safe default)
+  Start Mining.cmd         run the node and mine (asks for a backup first)
+  My Keys and Backup.cmd   save a wallet backup, or show your private keys
+  Check Status.cmd         show block, peers and balance
+(CacheCoin.cmd is the classic entry point behind them; it still works.)
+
+1. Double-click Start Node.cmd (or CacheCoin.cmd and choose "Node only").
+2. Choose mining only if you want it. Mining is a lottery: you may find a
+   block, you may not. There is no guaranteed reward.
 3. The first start can take a few minutes; the node syncs over Tor.
 4. Your data lives in %APPDATA%\CacheCoin. The log is in logs\launcher.log.
 5. To stop a node that this launcher started: right-click the tray icon and
