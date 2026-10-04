@@ -23,8 +23,7 @@ CacheCoin-Windows-<version>/
   docs\
     README.md                   # repository README
     SECURITY.md                 # repository security policy
-    START_HERE.md               # repository two-minute introduction
-    ...                         # every file from windows\docs\
+    ...                         # every file from windows\docs\ (START_HERE.txt, ...)
   tor\
     tor.exe                     # Tor Expert Bundle
     data\geoip, geoip6          # bundle data files
@@ -46,8 +45,8 @@ path to the script is the same in both places.
   `date`).
 - One zip backend: `zip`, `python3`/`python`, or `powershell.exe` (MSYS2
   fallback). The script picks one automatically.
-- A repository checkout: `patches/`, `LICENSE`, `README.md`, `SECURITY.md`,
-  `START_HERE.md` are read from it.
+- A repository checkout: `patches/`, `LICENSE`, `README.md` and `SECURITY.md`
+  are read from it.
 - `windows\launcher\CacheCoin.ps1`, `windows\CacheCoin.cmd` and
   `windows\docs\` (default `--launcher-dir` / `--docs-dir`).
 
@@ -116,9 +115,8 @@ A leading `v` is accepted (`--version v0.1.0` becomes `0.1.0`). The script:
 
 - fails if `cachecoind.exe`, `cachecoin-cli.exe`, `tor.exe`, the Tor license,
   the launcher files or the docs directory are missing;
-- copies the launcher, docs, `LICENSE`, `README.md`, `SECURITY.md` and
-  `START_HERE.md` (the last three into `docs\`, overwriting same-named files
-  already in `--docs-dir`);
+- copies the launcher, docs, `LICENSE`, `README.md` and `SECURITY.md` (the last
+  two into `docs\`, overwriting same-named files already in `--docs-dir`);
 - computes the patch fingerprint as `cat patches/*.patch | sha256sum`;
 - hashes every file into `version.json` and `SHA256SUMS.windows.txt`;
 - verifies `SHA256SUMS.windows.txt` against the package before zipping;

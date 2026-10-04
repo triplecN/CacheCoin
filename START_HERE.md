@@ -14,7 +14,7 @@ Some things to know before you spend time on it.
 
 **What to expect.** Mining can pay nothing for weeks, and the fee-sharing pool can sit empty for a month. CacheCoin is open-source software, provided as is under the MIT license; nothing here is financial advice, an offer or a promise of return.
 
-**Build from source.** The supported path is `bash scripts/build_linux.sh` on Ubuntu/WSL2 (see below), or `doc/build-windows.md` on native Windows. Signed releases, when published, attach the Linux binaries and `SHA256SUMS.txt` to GitHub Releases; the Windows `.exe` files are built by CI but are not attached by default, because no suite here tests them (`doc/release.md`). CI artifacts are a different thing: they expire after 90 days and need a GitHub login. Whatever route you take, verify the files before running them -- it is how you know they were not tampered with on the way to you:
+**Build from source.** The supported path is `bash scripts/build_linux.sh` on Ubuntu/WSL2 (see below), or `doc/build-windows.md` on native Windows. Signed releases attach the Linux binaries and `SHA256SUMS.txt`; a Windows package can be attached separately with its own notes and hashes (`windows/README.md`). CI artifacts are a different thing: they expire after 90 days and need a GitHub login. Whatever route you take, verify the files before running them -- it is how you know they were not tampered with on the way to you:
 
 ```powershell
 Get-FileHash cachecoind.exe -Algorithm SHA256
@@ -25,7 +25,7 @@ Get-FileHash cachecoind.exe -Algorithm SHA256
 
 No prebuilt binary? On Ubuntu, or WSL2 Ubuntu on Windows, it takes one command and 30-60 minutes: `bash scripts/build_linux.sh`. WSL2 is the supported Windows path. A native Windows build script is not provided, and the `.exe` files are outside this repository's test suites. See [`doc/build-windows.md`](doc/build-windows.md) if you want to build them yourself.
 
-**Tor has to be running before the node will connect to anything.** CacheCoin is Tor-only: it has no DNS seeds, no fixed seeds, and it opens no clearnet ports. A clearnet config exists (`config/cachecoin-clearnet.conf`) if you choose to use one. `config/cachecoin.conf` points at `127.0.0.1:9050`, which is the port the Tor Expert Bundle and a system Tor daemon use. **Tor Browser uses a different port, 9150.** If you installed Tor Browser, change `proxy=` in your config to `127.0.0.1:9150` or your node will start and sit at zero peers forever without saying why.
+**Tor has to be running before the node will connect to anything.** CacheCoin is Tor-only: it has no DNS seeds, no fixed seeds, and by default it listens on no ports at all. (The Windows launcher offers an opt-in "help other nodes connect" setting; when enabled, the node binds only `127.0.0.1`, never a public interface.) A clearnet config exists (`config/cachecoin-clearnet.conf`) if you choose to use one. `config/cachecoin.conf` points at `127.0.0.1:9050`, which is the port the Tor Expert Bundle and a system Tor daemon use. **Tor Browser uses a different port, 9150.** If you installed Tor Browser, change `proxy=` in your config to `127.0.0.1:9150` or your node will start and sit at zero peers forever without saying why.
 
 **Three things that tend to surprise people:**
 

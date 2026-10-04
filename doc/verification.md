@@ -179,3 +179,7 @@ bash tests/run_fuzz.sh "$B" 200000
   (`tests/per_adversarial_regtest.py`, `tests/per_regtest.py`,
   `tests/per_invariants.py`), which is also where upstream Bitcoin Core draws
   the line (its block fuzzer stops at `CheckBlock`).
+- Adversarial audits of the patch series found no inflation, permanent split,
+  balance-theft or permanent-wedging path; the findings that survive are
+  accepted as-is because fixing them changes consensus rules. See
+  `doc/consensus-audit-notes.md` for the list and the reasoning.

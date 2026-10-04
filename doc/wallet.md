@@ -60,14 +60,33 @@ cachecoin-cli -rpcwallet=main -named sendtoaddress address=<address> amount=1.25
 
 ## Restore on another machine
 
+The `.bak` file from `backupwallet` restores directly:
+
 ```bash
+cachecoin-cli restorewallet "restored" "/path/to/cachecoin-main-wallet-<date>.bak"
+```
+
+The descriptor JSON is an object, not an array: `importdescriptors` needs only
+its `descriptors` array, so extract it first (on Windows, pass it through
+`-stdin` so PowerShell does not mangle the quotes):
+
+```bash
+# Linux / WSL
 cachecoin-cli createwallet "restored"
-cachecoin-cli -rpcwallet=restored importdescriptors "$(cat main-descriptors.json)"
+cachecoin-cli -rpcwallet=restored importdescriptors "$(jq -c '.descriptors' main-descriptors.json)"
 cachecoin-cli -rpcwallet=restored rescanblockchain    # if the wallet needs history
 ```
 
-`importdescriptors` takes the same JSON `listdescriptors true` produced. If you
-only have a single key, turn it into a descriptor first:
+```powershell
+# Windows PowerShell
+cachecoin-cli createwallet "restored"
+$j = Get-Content .\main-descriptors.json -Raw | ConvertFrom-Json
+$j.descriptors | ConvertTo-Json -Depth 10 -Compress |
+  cachecoin-cli -rpcwallet=restored -stdin importdescriptors
+cachecoin-cli -rpcwallet=restored rescanblockchain
+```
+
+If you only have a single key, turn it into a descriptor first:
 
 ```bash
 cachecoin-cli getdescriptorinfo "wpkh(<WIF>)"        # note the checksum

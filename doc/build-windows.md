@@ -48,7 +48,7 @@ cd /c/b
 # This assumes the repository is checked out at ~/Cachecoin; adjust the path otherwise.
 for p in "$HOME/Cachecoin/patches/"*.patch; do
   echo "-> $(basename "$p")"
-  git apply --index "$p"
+  git apply --index "$p" || { echo "FAILED: $(basename "$p")"; exit 1; }
 done
 ```
 
@@ -56,7 +56,8 @@ The order matters, and so does the filename glob. `patches/0001-...` has to land
 `patches/0020-...`, and the series has to be applied as a whole: later patches edit code
 that earlier ones add, and `patches/0012` removes development comments the earlier patches
 carried. Apply them in filename order, 0001 through 0020; never apply them individually
-with a GUI patch tool.
+with a GUI patch tool. The loop above stops on the first failure: a half-applied series
+still compiles, and its `--version` output looks identical to an unpatched build.
 (On Windows, make sure Git checked the sources out with LF; see the `core.autocrlf` line in
 `.github/workflows/build.yml`, or `git apply --index` can fail with "does not match index".)
 
@@ -70,7 +71,8 @@ mkdir -p /c/b/src/crypto/randomx/build
 cd /c/b/src/crypto/randomx/build
 cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -j4
-./randomx-tests > randomx-tests.log && tail -1 randomx-tests.log
+./randomx-tests > randomx-tests.log || { tail -20 randomx-tests.log; exit 1; }
+tail -1 randomx-tests.log
 cd /c/b
 cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
     -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI=OFF \
@@ -79,8 +81,11 @@ cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
 cmake --build build -j4 --target bitcoind bitcoin-cli
 ```
 
-The build will fail if the RandomX self-test fails. That is intentional: it means this machine
-computes a different proof-of-work than the network expects, and the node must not start.
+The `randomx-tests` line above stops the manual session if the self-test fails. The CMake
+step itself only checks that the RandomX files exist; the node runs `RandomXSelfTest()` at
+startup and refuses to run if this machine computes a different proof-of-work than the
+network expects. After the build, a quick patch check: `./build/bin/bitcoind.exe --help`
+should mention `cachecoin.conf` (an unpatched build says `bitcoin.conf`).
 
 ## 5. Collect the binaries
 

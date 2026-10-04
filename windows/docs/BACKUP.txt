@@ -5,19 +5,41 @@ CacheCoin wallets have no seed phrase. The wallet file is the wallet.
 
 Before mining starts, the launcher saves two files to the folder you choose:
 
-  cachecoin-main-wallet-<date>.bak     the wallet file
-  cachecoin-main-descriptors-<date>.json   the keys, in text form
+  cachecoin-main-wallet-<date>.bak        the wallet file
+  cachecoin-main-descriptors-<date>.json  the keys, in text form
 
-Both files together can spend your coins. Anyone who has them can take your
-coins. There is no recovery service and no support line. If you lose both
-files, the coins are gone.
+Either file can restore your wallet on its own: the .bak with "restorewallet",
+or the descriptor JSON with "importdescriptors". Anyone who has either file can
+take your coins. There is no recovery service and no support line. If you lose
+both files, the coins are gone.
 
 Rules:
 - Save them to a USB drive or another disk, not the same disk as the app.
 - Keep copies offline. Do not email them. Do not upload them.
 - Check the SHA-256 values the launcher prints against the files later.
-- If you receive coins later, make a fresh backup; an old backup may not
-  include newer addresses.
+- The launcher writes the backup path and both SHA-256 values into
+  logs\launcher.log; use that to find which files belong to which wallet.
+- If you receive coins later, make a fresh backup. The launcher has no backup
+  button after the first confirmation; make one by hand while the node runs:
+    cachecoin-cli backupwallet "E:\cachecoin-backup\wallet.bak"
+    cachecoin-cli -rpcwallet=main listdescriptors true > "E:\cachecoin-backup\descriptors.json"
+
+RESTORE (if the wallet is lost or you move to another computer)
+---------------------------------------------------------------
+1. Stop the node (CacheCoin.cmd -Stop) and move the old wallet folder away:
+   rename %APPDATA%\CacheCoin\wallets  (or %APPDATA%\CacheCoin\main, whichever
+   exists) to wallets.old.
+2. Start the node again, then restore:
+   a) From the .bak file (recommended):
+        cachecoin-cli restorewallet main "E:\cachecoin-main-wallet-<date>.bak"
+   b) Or from the descriptor JSON (Windows PowerShell):
+        $j = Get-Content "E:\cachecoin-main-descriptors-<date>.json" -Raw | ConvertFrom-Json
+        $d = $j.descriptors | ConvertTo-Json -Depth 10 -Compress
+        $d | cachecoin-cli -rpcwallet=main -stdin importdescriptors
+3. Wait for the rescan to finish; the balance appears in getbalances.
+
+Do not type the JSON as a normal command-line argument on Windows: PowerShell
+mangles the quotes. Use the -stdin form above.
 
 The launcher will not start mining until you type the confirmation sentence.
 Until that confirmation is saved, mining does not start either, including after

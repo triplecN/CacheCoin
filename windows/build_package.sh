@@ -142,9 +142,6 @@ elif [ -f "$TOR_DIR/tor/tor.exe" ]; then
 else
     die "tor.exe not found: expected $TOR_DIR/tor.exe or $TOR_DIR/tor/tor.exe"
 fi
-if [ -z "$(find "$TOR_DIR" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'tor.txt' \) -print -quit)" ]; then
-    die "no license file found under $TOR_DIR (the Tor license must travel with the bundle; the Expert Bundle ships docs/tor.txt)"
-fi
 [ -f "$LAUNCHER_DIR/launcher/CacheCoin.ps1" ] || die "missing launcher: $LAUNCHER_DIR/launcher/CacheCoin.ps1"
 [ -f "$LAUNCHER_DIR/CacheCoin.cmd" ] || die "missing launcher shim: $LAUNCHER_DIR/CacheCoin.cmd"
 
@@ -187,12 +184,15 @@ if [ "$TOR_MODE" = "bundle" ]; then
 else
     cp -R -- "$TOR_DIR"/. "$PKG/tor/"
 fi
+if [ -z "$(find "$PKG/tor" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'tor.txt' \) -print -quit)" ]; then
+    die "the copied Tor files contain no license file (tor.txt); check --tor-dir"
+fi
 
 cp -R -- "$LAUNCHER_DIR/launcher"/. "$PKG/launcher/"
 cp -- "$LAUNCHER_DIR/CacheCoin.cmd" "$PKG/CacheCoin.cmd"
 
 cp -R -- "$DOCS_DIR"/. "$PKG/docs/"
-for f in README.md SECURITY.md START_HERE.md; do
+for f in README.md SECURITY.md; do
     if [ -f "$REPO_ROOT/$f" ]; then
         cp -- "$REPO_ROOT/$f" "$PKG/docs/$f"
     fi
@@ -332,7 +332,7 @@ PSEOF
             pkg_w="$(wslpath -w "$PKG")"
             zip_w="$(wslpath -w "$ZIP")"
         fi
-        CCCN_PKG="$pkg_w" CCCN_ZIP="$zip_w" powershell.exe -NoProfile -NonInteractive \
+        CCCN_PKG="$pkg_w" CCCN_ZIP="$zip_w" WSLENV="CCCN_PKG:CCCN_ZIP" powershell.exe -NoProfile -NonInteractive \
             -ExecutionPolicy Bypass -File "$ps1_w"
         rm -f -- "$TMP_PS1"
         trap - EXIT

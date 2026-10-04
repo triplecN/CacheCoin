@@ -5,7 +5,8 @@ param(
     [ValidateSet('node', 'mining')][string]$Mode,
     [int]$RunSeconds = 0,
     [switch]$Stop,
-    [switch]$DisableAutostart
+    [switch]$DisableAutostart,
+    [switch]$EnableAutostart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,6 +44,9 @@ $script:WorkerRuns = 0
 $script:MiningNextRefill = (Get-Date)
 $script:LogWriteCount = 0
 $script:LastTipRefresh = [DateTime]::MinValue
+$script:TimeOffset = 0
+$script:NodeOutLog = Join-Path $script:LogDir 'node-out.log'
+$script:NodeErrLog = Join-Path $script:LogDir 'node-err.log'
 $script:LockStream = $null
 $script:MiningFailStreak = 0
 $script:AttachedMissCount = 0
@@ -90,11 +94,20 @@ function Test-PackageHashes {
     $manifest = $null
     try { $manifest = Get-Content -LiteralPath $script:VersionFile -Raw | ConvertFrom-Json } catch { Fail 'version.json is unreadable. Download the package again.' }
     if (-not $manifest.files) {
-        Write-Log 'version.json lists no files; hashes are not being verified.' 'WARN'
-        return
+        Fail 'version.json lists no files; refusing to run a package that cannot be verified.'
     }
+    $map = @{}
     foreach ($prop in $manifest.files.PSObject.Properties) {
-        $rel = $prop.Name -replace '/', '\'
+        $map[($prop.Name -replace '\\', '/')] = [string]$prop.Value
+    }
+    foreach ($req in @('bin/cachecoind.exe', 'bin/cachecoin-cli.exe', 'tor/tor.exe', 'launcher/CacheCoin.ps1')) {
+        if (-not $map.ContainsKey($req)) {
+            Fail "version.json does not list the required file $req. Download the package again."
+        }
+    }
+    $checked = 0
+    foreach ($name in $map.Keys) {
+        $rel = $name -replace '/', '\'
         $full = Join-Path $script:Root $rel
         if (-not (Test-Path -LiteralPath $full)) {
             if ($rel -match '^(bin|tor)\\') {
@@ -104,11 +117,12 @@ function Test-PackageHashes {
             continue
         }
         $actual = Get-Sha256 $full
-        if ($actual -ne ([string]$prop.Value).ToLowerInvariant()) {
-            Fail ("A file does not match the published hash: {0}`nExpected: {1}`nFound:    {2}`nDo not run this copy; download it again." -f $rel, $prop.Value, $actual)
+        if ($actual -ne $map[$name].ToLowerInvariant()) {
+            Fail ("A file does not match the published hash: {0}`nExpected: {1}`nFound:    {2}`nDo not run this copy; download it again." -f $rel, $map[$name], $actual)
         }
+        $checked++
     }
-    Write-Log 'Package files match version.json.'
+    Write-Log "Package files match version.json ($checked files checked)."
 }
 
 function Test-TcpPort {
@@ -207,9 +221,12 @@ function Initialize-Config {
     } else {
         $required['listen'] = '0'
     }
+    $bindLines = @()
+    if ($Listen) { $bindLines = @('bind=127.0.0.1:29333', 'bind=127.0.0.1:29334=onion') }
     if (-not (Test-Path -LiteralPath $script:ConfPath)) {
         $content = @()
         foreach ($k in $required.Keys) { $content += "$k=$($required[$k])" }
+        foreach ($b in $bindLines) { $content += $b }
         try { [System.IO.File]::WriteAllLines($script:ConfPath, $content, (New-Object System.Text.UTF8Encoding($false))) }
         catch { Fail "Could not write $($script:ConfPath): $($_.Exception.Message)" }
         Write-Log "Created $($script:ConfPath)"
@@ -219,15 +236,19 @@ function Initialize-Config {
     try { $rawBytes = [System.IO.File]::ReadAllBytes($script:ConfPath) } catch { Fail "Could not read $($script:ConfPath): $($_.Exception.Message)" }
     $confEncoding = [System.Text.Encoding]::Default
     $confText = $null
+    $converted = $false
     if ($rawBytes.Length -ge 2 -and $rawBytes[0] -eq 0xFF -and $rawBytes[1] -eq 0xFE) {
         $confText = [System.Text.Encoding]::Unicode.GetString($rawBytes, 2, $rawBytes.Length - 2)
         $confEncoding = New-Object System.Text.UTF8Encoding($false)
+        $converted = $true
     } elseif ($rawBytes.Length -ge 2 -and $rawBytes[0] -eq 0xFE -and $rawBytes[1] -eq 0xFF) {
         $confText = [System.Text.Encoding]::BigEndianUnicode.GetString($rawBytes, 2, $rawBytes.Length - 2)
         $confEncoding = New-Object System.Text.UTF8Encoding($false)
+        $converted = $true
     } elseif ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $confText = [System.Text.Encoding]::UTF8.GetString($rawBytes, 3, $rawBytes.Length - 3)
         $confEncoding = New-Object System.Text.UTF8Encoding($false)
+        $converted = $true
     } else {
         try {
             $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
@@ -244,12 +265,24 @@ function Initialize-Config {
     while ($null -ne ($line = $reader.ReadLine())) { $existing.Add($line) }
     $reader.Close()
     $proxyValue = [string]$required['proxy']
+    $torcontrolValue = ''
+    if ($Listen) {
+        if ($ProxyPort -eq 9150) { $torcontrolValue = '127.0.0.1:9151' } else { $torcontrolValue = '127.0.0.1:9051' }
+    }
     $proxyChanged = $false
+    $torcontrolChanged = $false
     $customProxy = $false
     $localProxyEmitted = $false
     $newLines = New-Object System.Collections.Generic.List[string]
+    $section = ''
     foreach ($l in $existing) {
-        if ($l -match '(?i)^\s*proxy\s*=') {
+        if ($l -match '^\s*\[([^\]]+)\]') {
+            $section = $Matches[1].Trim().ToLowerInvariant()
+            $newLines.Add($l)
+            continue
+        }
+        $inScope = ($section -eq '' -or $section -eq 'main')
+        if ($inScope -and $l -match '(?i)^\s*proxy\s*=') {
             if ($l -match '(?i)^\s*proxy\s*=\s*127\.0\.0\.1:\d+\s*(#.*)?$') {
                 if (-not $localProxyEmitted) {
                     $newLines.Add("proxy=$proxyValue")
@@ -264,6 +297,19 @@ function Initialize-Config {
             }
             continue
         }
+        if ($inScope -and $torcontrolValue -and $l -match '(?i)^\s*torcontrol\s*=') {
+            if ($l -match '(?i)^\s*torcontrol\s*=\s*127\.0\.0\.1:\d+\s*$') {
+                if ($l.Trim() -ne "torcontrol=$torcontrolValue") {
+                    $newLines.Add("torcontrol=$torcontrolValue")
+                    $torcontrolChanged = $true
+                } else {
+                    $newLines.Add($l)
+                }
+            } else {
+                $newLines.Add($l)
+            }
+            continue
+        }
         $newLines.Add($l)
     }
     $proxySeen = $localProxyEmitted -or $customProxy
@@ -271,29 +317,45 @@ function Initialize-Config {
     foreach ($k in $required.Keys) {
         if ($k -eq 'proxy' -and $proxySeen) { continue }
         $found = $false
+        $scanSection = ''
         foreach ($l in $existing) {
+            if ($l -match '^\s*\[([^\]]+)\]') { $scanSection = $Matches[1].Trim().ToLowerInvariant(); continue }
+            if ($scanSection -ne '' -and $scanSection -ne 'main') { continue }
             if ($l -cmatch ("^\s*" + [regex]::Escape($k) + "\s*=")) { $found = $true; break }
         }
         if (-not $found) { $missing += $k }
     }
-    if ($missing.Count -gt 0) {
+    $missingBinds = @()
+    foreach ($b in $bindLines) {
+        $found = $false
+        foreach ($l in $existing) { if ($l.Trim() -ceq $b) { $found = $true; break } }
+        if (-not $found) { $missingBinds += $b }
+    }
+    if ($missing.Count -gt 0 -or $missingBinds.Count -gt 0) {
         $insertAt = -1
         for ($i = 0; $i -lt $newLines.Count; $i++) {
             if ($newLines[$i] -match '^\s*\[') { $insertAt = $i; break }
         }
         if ($insertAt -ge 0) {
+            for ($j = $missingBinds.Count - 1; $j -ge 0; $j--) {
+                $newLines.Insert($insertAt, $missingBinds[$j])
+            }
             for ($j = $missing.Count - 1; $j -ge 0; $j--) {
                 $newLines.Insert($insertAt, "$($missing[$j])=$($required[$missing[$j]])")
             }
         } else {
             foreach ($k in $missing) { $newLines.Add("$k=$($required[$k])") }
+            foreach ($b in $missingBinds) { $newLines.Add($b) }
         }
     }
-    if ($missing.Count -gt 0 -or $proxyChanged) {
+    if ($missing.Count -gt 0 -or $missingBinds.Count -gt 0 -or $proxyChanged -or $torcontrolChanged -or $converted) {
         try { [System.IO.File]::WriteAllLines($script:ConfPath, $newLines.ToArray(), $confEncoding) }
         catch { Fail "Could not update $($script:ConfPath): $($_.Exception.Message)" }
         if ($missing.Count -gt 0) { Write-Log ('Added missing settings: ' + ($missing -join ', ')) }
+        if ($missingBinds.Count -gt 0) { Write-Log 'Added loopback bind lines for incoming connections.' }
         if ($proxyChanged) { Write-Log "Updated the local proxy setting to 127.0.0.1:$ProxyPort." }
+        if ($torcontrolChanged) { Write-Log "Updated the Tor control setting to $torcontrolValue." }
+        if ($converted) { Write-Log 'Converted cachecoin.conf to UTF-8 (it was UTF-16 or had a BOM).' }
     }
     if ($customProxy) {
         Write-Log 'A custom proxy line is set in cachecoin.conf; the launcher keeps it. If it does not point at a working Tor SOCKS port, the node will not connect.' 'WARN'
@@ -345,7 +407,7 @@ function Start-Node {
     }
     Write-Log 'Starting the node...'
     try {
-        $script:NodeProcess = Start-Process -FilePath $script:Daemon -ArgumentList @("`"-datadir=$($script:DataDir)`"", "`"-conf=$($script:ConfPath)`"") -WindowStyle Hidden -PassThru
+        $script:NodeProcess = Start-Process -FilePath $script:Daemon -ArgumentList @("`"-datadir=$($script:DataDir)`"", "`"-conf=$($script:ConfPath)`"") -WindowStyle Hidden -PassThru -RedirectStandardOutput $script:NodeOutLog -RedirectStandardError $script:NodeErrLog
     } catch {
         Fail "Could not start the node: $($_.Exception.Message)"
     }
@@ -383,6 +445,10 @@ function Get-Status {
             if ($hdr) {
                 try { $script:LastTipTime = [long](($hdr | ConvertFrom-Json).time) } catch { }
             }
+        }
+        $ni = Invoke-Rpc @('getnetworkinfo')
+        if ($ni) {
+            try { $script:TimeOffset = [long](($ni | ConvertFrom-Json).timeoffset) } catch { }
         }
         $script:LastTipRefresh = Get-Date
     }
@@ -523,10 +589,12 @@ function Update-MiningGate {
     $reason = ''
     if (-not $st.Running) {
         $reason = 'The node is not answering; mining is paused until it is back.'
-    } elseif ($st.IBD -and $st.Headers -gt 0) {
+    } elseif ($st.Headers -gt $st.Height + 1) {
         $reason = 'The node is still syncing; mining will start when it is up to date.'
     } elseif ($st.Peers -eq 0) {
         $reason = 'No peers yet; mining will resume when the node connects.'
+    } elseif ($script:TimeOffset -ne 0 -and [Math]::Abs($script:TimeOffset) -gt 300) {
+        $reason = ('The computer clock is off by {0} seconds; mining is paused until it is fixed.' -f $script:TimeOffset)
     } elseif ($script:LastTipTime -gt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 300)) {
         $reason = 'The network clock is ahead of this computer; mining is paused.'
     }
@@ -567,10 +635,10 @@ function Get-OrCreateWallet {
 function Test-DatadirCommandLine {
     param([string]$CommandLine)
     if (-not $CommandLine) { return $false }
-    $m = [regex]::Match($CommandLine, '(?i)-datadir=(?:"([^"]*)"|(\S+))')
+    $m = [regex]::Match($CommandLine, '(?i)(?:^|\s)(?:"-datadir=(?<v>[^"]*)"?|-datadir="(?<v>[^"]*)"?|-datadir=(?<v>[^\s"]+))')
     if (-not $m.Success) { return $false }
-    $arg = $m.Groups[1].Value
-    if (-not $arg) { $arg = $m.Groups[2].Value }
+    $arg = $m.Groups['v'].Value.Trim('"')
+    if (-not $arg) { return $false }
     try { $arg = [System.IO.Path]::GetFullPath($arg) } catch { return $false }
     return ($arg.TrimEnd('\') -ieq $script:DataDir.TrimEnd('\'))
 }
@@ -610,12 +678,19 @@ function Get-MiningAddress {
 function Get-WalletFingerprint {
     $d = Invoke-Rpc @('-rpcwallet=main', 'listdescriptors')
     if (-not $d) { return '' }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($d.Trim()))
-        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
-    } finally {
-        $sha.Dispose()
+        $obj = $d | ConvertFrom-Json
+        $descs = @($obj.descriptors | ForEach-Object { [string]$_.desc } | Sort-Object)
+        if ($descs.Count -eq 0) { return '' }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($descs -join "`n")))
+            return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally {
+            $sha.Dispose()
+        }
+    } catch {
+        return ''
     }
 }
 
@@ -630,11 +705,16 @@ function Test-AddressOwned {
 function Save-State {
     param([string]$Mode)
     try {
+        $fp = $script:WalletFingerprint
+        if (-not $fp) {
+            $existing = Read-State
+            if ($existing -and $existing.walletFingerprint) { $fp = [string]$existing.walletFingerprint }
+        }
         ([ordered]@{
             mode              = $Mode
             backupConfirmed   = $script:BackupConfirmed
             miningAddress     = $script:Address
-            walletFingerprint = $script:WalletFingerprint
+            walletFingerprint = $fp
             version           = 1
         } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $script:StateFile -Encoding UTF8
     } catch { }
@@ -658,9 +738,15 @@ function Invoke-BackupGate {
         Write-Host 'That folder does not exist.'
         return $false
     }
-    if ($resolved -match '(?i)\\OneDrive') {
-        Write-Host 'Warning: that folder is inside OneDrive, so the backup would sync to the cloud.'
+    if ($resolved -match '(?i)\\(OneDrive|Dropbox|Google ?Drive|iCloud|MEGAsync|pCloud|Nextcloud|Syncthing|YandexDisk|Box|SharePoint|Creative Cloud Files)(\\|$)') {
+        Write-Host 'Warning: that folder syncs to the cloud, so the backup would leave this computer.'
         Write-Host 'A USB drive or a plain local folder is safer for wallet keys.'
+    }
+    $rootWithSlash = $script:Root.TrimEnd('\') + '\'
+    if (($resolved.TrimEnd('\') + '\').StartsWith($rootWithSlash, [System.StringComparison]::OrdinalIgnoreCase) -or
+        ($resolved.TrimEnd('\') -ieq $script:Root.TrimEnd('\'))) {
+        Write-Host 'Choose a folder outside the CacheCoin app folder (it can be deleted on upgrade).'
+        return $false
     }
     $dataDirWithSlash = $script:DataDir.TrimEnd('\') + '\'
     if (($resolved.TrimEnd('\') + '\').StartsWith($dataDirWithSlash, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -767,8 +853,17 @@ function Show-StatusDialog {
     $st = Get-Status
     $balText = 'wallet not loaded'
     if ($st.WalletLoaded) { $balText = "$($st.Balance) CCCN trusted, $($st.Immature) CCCN immature" }
-    $text = "CacheCoin`n`nPeers: $($st.Peers)`nBlock: $($st.Height) of $($st.Headers)`nMining: $($script:Mining)`nBalance: $balText"
-    try { [System.Windows.Forms.MessageBox]::Show($text, 'CacheCoin status') | Out-Null } catch { }
+    $text = "Peers: $($st.Peers)`nBlock: $($st.Height) of $($st.Headers)`nMining: $($script:Mining)`nBalance: $balText"
+    Write-Log ("Status requested: " + ($text -replace "`n", '; '))
+    if ($script:Tray) {
+        try {
+            $script:Tray.BalloonTipTitle = 'CacheCoin status'
+            $script:Tray.BalloonTipText = $text
+            $script:Tray.ShowBalloonTip(10000)
+        } catch { }
+    } else {
+        Write-Host $text
+    }
 }
 
 function Initialize-Tray {
@@ -802,14 +897,25 @@ function Initialize-Tray {
 
 if ($SelfTest) {
     Write-Host 'CacheCoin launcher'
-    Write-Host 'Usage: CacheCoin.cmd [-Silent] [-Mode node|mining] [-RunSeconds N] [-Stop] [-DisableAutostart]'
+    Write-Host 'Usage: CacheCoin.cmd [-Silent] [-Mode node|mining] [-RunSeconds N] [-Stop] [-DisableAutostart] [-EnableAutostart]'
     Write-Host '  -Silent           run without prompts (used by autostart)'
     Write-Host '  -Mode             force node-only or node+mining'
     Write-Host '  -RunSeconds       stop cleanly after N seconds (testing)'
     Write-Host '  -Stop             stop the running node (the launcher exits when it stops)'
     Write-Host '  -DisableAutostart remove the logon task and exit'
+    Write-Host '  -EnableAutostart  register the logon task for this folder and exit'
     Write-Host 'Self-test OK.'
     exit 0
+}
+
+if ($EnableAutostart) {
+    Enable-Autostart
+    if (Get-ScheduledTask -TaskName 'CacheCoin Node' -ErrorAction SilentlyContinue) {
+        Write-Host 'Autostart enabled for this folder.'
+        exit 0
+    }
+    Write-Host 'Could not register the autostart task.'
+    exit 1
 }
 
 if ($DisableAutostart) {
@@ -848,7 +954,13 @@ if ($Stop) {
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\CacheCoinLauncher')
 if (-not $mutex.WaitOne(0)) {
-    Write-Host 'CacheCoin is already running.'
+    Write-Host 'CacheCoin is already running. Use CacheCoin.cmd -Stop to stop it.'
+    if (-not $Silent) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("CacheCoin is already running.`n`nTo stop it, run: CacheCoin.cmd -Stop", 'CacheCoin') | Out-Null
+        } catch { }
+    }
     exit 0
 }
 
@@ -857,7 +969,13 @@ try {
     if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
     $script:LockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
 } catch {
-    Write-Host 'CacheCoin is already running in another session on this computer.'
+    Write-Host 'CacheCoin is already running in another session on this computer. Use CacheCoin.cmd -Stop to stop it.'
+    if (-not $Silent) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("CacheCoin is already running in another session.`n`nTo stop it, run: CacheCoin.cmd -Stop", 'CacheCoin') | Out-Null
+        } catch { }
+    }
     try { $mutex.ReleaseMutex() } catch { }
     exit 0
 }
@@ -869,6 +987,16 @@ try {
     Stop-StaleMiningProcesses
 
     $state = Read-State
+    if (-not $Silent) {
+        try {
+            $task = Get-ScheduledTask -TaskName 'CacheCoin Node' -ErrorAction SilentlyContinue
+            $wantPs1 = (Join-Path $script:Root 'launcher\CacheCoin.ps1')
+            if ($task -and ($task.Actions[0].Execute -ne 'powershell.exe' -or $task.Actions[0].Arguments -notlike "*$wantPs1*")) {
+                Write-Log 'The autostart task points at a different CacheCoin folder or an older command; re-registering it for this folder.' 'WARN'
+                Enable-Autostart
+            }
+        } catch { }
+    }
     $chosen = $Mode
     if (-not $chosen -and $state -and $state.mode) { $chosen = [string]$state.mode }
     if (-not $chosen) {
@@ -912,7 +1040,14 @@ try {
             Write-Log 'The node stopped cleanly during startup (a stop was requested); the launcher is exiting.'
             exit 0
         }
-        Fail "The node did not answer within 3 minutes. See the log: $($script:LogFile)"
+        $hint = ''
+        try {
+            if (Test-Path -LiteralPath $script:NodeErrLog) {
+                $last = ((Get-Content -LiteralPath $script:NodeErrLog -Tail 3 -ErrorAction SilentlyContinue) | Where-Object { $_ }) -join ' '
+                if ($last) { $hint = " Last node message: $last" }
+            }
+        } catch { }
+        Fail "The node did not answer within 3 minutes.$hint See the log: $($script:LogFile)"
     }
     Write-Log 'The node is running.'
 
@@ -947,7 +1082,7 @@ try {
         } elseif ($state -and $state.walletFingerprint -and $script:WalletFingerprint -and ([string]$state.walletFingerprint -ne $script:WalletFingerprint)) {
             $script:BackupConfirmed = $false
             $script:Address = ''
-            Write-Log 'The wallet on disk is not the one that was backed up; a new backup is required before mining.' 'WARN'
+            Write-Log 'The wallet on disk does not match the last backup record (this can also happen once after a launcher update). Mining waits for a new backup confirmation.' 'WARN'
         }
         if ($script:Address -and -not (Test-AddressOwned -Address $script:Address)) {
             Write-Log 'The saved mining address does not belong to the loaded wallet; a new address will be used.' 'WARN'
