@@ -502,7 +502,7 @@ function Write-StatusLine {
     }
     if ($script:Mining) {
         if ($script:MiningGated) {
-            Write-Host 'Mining is paused (waiting for peers or a sane network clock).'
+            Write-Host 'Mining is paused (waiting for the node, sync or peers).'
         } else {
             Write-Host ('Mining: {0} worker(s). Blocks found: {1}. Worker runs: {2}.' -f $script:MiningJobs.Count, $script:FoundBlocks, $script:WorkerRuns)
         }
@@ -615,14 +615,18 @@ function Update-MiningGate {
         $reason = 'The node is still syncing; mining will start when it is up to date.'
     } elseif ($st.Peers -eq 0) {
         $reason = 'No peers yet; mining will resume when the node connects.'
-    } elseif ($script:TimeOffset -lt -300 -and $script:LastTipTime -gt 0 -and $script:LastTipTime -lt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 300)) {
-        $reason = ('Your clock is ahead of the network (peers report about {0} seconds); mining is paused until it is fixed.' -f [Math]::Abs($script:TimeOffset))
-    } elseif ($script:LastTipTime -gt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 300)) {
-        $reason = 'The network clock is ahead of this computer; mining is paused.'
     }
-    if ($script:TimeOffset -gt 300 -and -not $script:ClockWarned) {
-        Write-Log ('Peers report a time difference of about {0} seconds; if your clock is wrong, fix it before mining. Mining is not paused for this alone.' -f $script:TimeOffset) 'WARN'
-        $script:ClockWarned = $true
+    if (-not $script:ClockWarned) {
+        if ($script:TimeOffset -lt -300) {
+            Write-Log ('Peers report a time difference of about {0} seconds: your clock may be ahead. If Windows time is wrong, fix it; a block found with a wrong clock can be rejected by the network. Mining is not paused for this alone.' -f [Math]::Abs($script:TimeOffset)) 'WARN'
+            $script:ClockWarned = $true
+        } elseif ($script:TimeOffset -gt 300) {
+            Write-Log ('Peers report a time difference of about {0} seconds: your clock may be behind. If Windows time is wrong, fix it. Mining is not paused for this alone.' -f $script:TimeOffset) 'WARN'
+            $script:ClockWarned = $true
+        } elseif ($script:LastTipTime -gt 0 -and $script:LastTipTime -gt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 300)) {
+            Write-Log 'The chain tip is ahead of this computer''s clock. If Windows time is wrong, fix it. Mining is not paused for this alone.' 'WARN'
+            $script:ClockWarned = $true
+        }
     }
     if ($reason -ne '') {
         if (-not $script:MiningGated) {

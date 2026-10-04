@@ -1,6 +1,9 @@
 CacheCoin (CCCN) - START HERE
 ============================
 
+New to CacheCoin and not a programmer? Read docs\BEGINNER_GUIDE.md first:
+step-by-step instructions in plain English, including backups and private keys.
+
 CacheCoin is a small, Tor-only cryptocurrency. This folder runs a full node,
 and optionally mines on your CPU.
 

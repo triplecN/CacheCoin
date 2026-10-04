@@ -21,7 +21,7 @@ Rules:
   logs\launcher.log; use that to find which files belong to which wallet.
 - If you receive coins later, make a fresh backup. The launcher has no backup
   button after the first confirmation; make one by hand while the node runs
-  (open a Command Prompt or PowerShell in the CacheCoin folder, the folder
+  (open PowerShell in the CacheCoin folder, the folder
   with CacheCoin.cmd, and use .\bin\cachecoin-cli.exe):
     .\bin\cachecoin-cli.exe -rpcwallet=main backupwallet "E:\cachecoin-backup\wallet.bak"
     $d = .\bin\cachecoin-cli.exe -rpcwallet=main listdescriptors true
@@ -31,15 +31,17 @@ Rules:
 
 RESTORE (if the wallet is lost or you move to another computer)
 ---------------------------------------------------------------
-Run these from a Command Prompt or PowerShell opened in the CacheCoin folder.
-Use .\bin\cachecoin-cli.exe exactly as shown; a bare cachecoin-cli will not be
-found from that folder.
+Run these from PowerShell opened in the CacheCoin folder (every step here is
+PowerShell). Use .\bin\cachecoin-cli.exe exactly as shown; a bare
+cachecoin-cli will not be found from that folder.
 
 1. Stop the node if it is running:
      .\bin\cachecoin-cli.exe stop
 2. Move the old wallet folder away, so the restore does not hit a name clash:
-     ren "%APPDATA%\CacheCoin\wallets" wallets.old
-   If that folder does not exist, rename "%APPDATA%\CacheCoin\main" instead.
+     Rename-Item "$env:APPDATA\CacheCoin\wallets" wallets.old
+   If that folder does not exist, rename "$env:APPDATA\CacheCoin\main" instead.
+   If wallets.old already exists from an earlier restore, pick another name,
+   for example wallets.old2.
 3. Start the launcher in node-only mode. Do NOT start normal mining mode first:
    it would create a new, empty wallet and the restore would fail.
      CacheCoin.cmd -Mode node
@@ -55,8 +57,11 @@ found from that folder.
 5. Wait for the rescan to finish; the balance appears in getbalances. The
    descriptor restore rescans from the start of the chain, so it can take a
    while on a long chain.
-6. Close the node-only launcher and start CacheCoin normally. Confirm the
-   backup when asked, and mining resumes with your restored address.
+6. Close the node-only launcher and start mining mode once:
+     CacheCoin.cmd -Mode mining
+   Save and confirm a backup when asked. Mining resumes with your restored
+   address. After this one start, the saved mode is mining again, so a normal
+   double-click works from then on.
 
 Do not type the JSON as a normal command-line argument on Windows: PowerShell
 mangles the quotes. Use the -stdin form above.
