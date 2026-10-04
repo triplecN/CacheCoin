@@ -6,6 +6,8 @@ $script:Root = Split-Path -Parent $PSScriptRoot
 $script:DataDir = Join-Path $env:APPDATA 'CacheCoin'
 $script:Cli = Join-Path $script:Root 'bin\cachecoin-cli.exe'
 
+. (Join-Path $PSScriptRoot 'CacheCoin-Package.ps1')
+
 function Pause-Exit {
     Read-Host 'Press Enter to close this window' | Out-Null
 }
@@ -28,6 +30,12 @@ Write-Host ''
 if (-not (Test-Path -LiteralPath $script:Cli)) {
     Write-Host 'cachecoin-cli.exe was not found next to this script.'
     Write-Host 'Unpack the whole ZIP first, then run this file from the package folder.'
+    Pause-Exit
+    exit 1
+}
+if (-not (Test-PackageIntegrity -Root $script:Root)) {
+    Write-Host 'This package does not match its version.json file; not running.'
+    Write-Host 'Download it again and verify it with docs\VERIFY.txt.'
     Pause-Exit
     exit 1
 }

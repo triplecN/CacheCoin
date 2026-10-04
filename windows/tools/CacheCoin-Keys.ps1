@@ -10,6 +10,8 @@ $script:Conf = Join-Path $script:DataDir 'cachecoin.conf'
 $script:StartedNode = $false
 $script:NodeProcess = $null
 
+. (Join-Path $PSScriptRoot 'CacheCoin-Package.ps1')
+
 function Pause-Exit {
     Read-Host 'Press Enter to close this window' | Out-Null
 }
@@ -163,6 +165,13 @@ Write-Host ''
 if (-not (Test-Path -LiteralPath $script:Cli) -or -not (Test-Path -LiteralPath $script:Daemon)) {
     Write-Host 'The CacheCoin programs were not found next to this script.'
     Write-Host 'Unpack the whole ZIP first, then run this file from the package folder.'
+    Pause-Exit
+    exit 1
+}
+if (-not (Test-PackageIntegrity -Root $script:Root)) {
+    Write-Host 'This package does not match its version.json file.'
+    Write-Host 'Do not trust it with your keys. Download the package again and verify'
+    Write-Host 'it with docs\VERIFY.txt before running this tool.'
     Pause-Exit
     exit 1
 }

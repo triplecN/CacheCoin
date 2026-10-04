@@ -26,6 +26,7 @@ CacheCoin-Windows-<version>/
     CacheCoin.ps1               # launcher written for this package
   tools\
     CacheCoin-Keys.ps1          # script behind My Keys and Backup.cmd
+    CacheCoin-Package.ps1       # version.json integrity check shared by the tools
     CacheCoin-Status.ps1        # script behind Check Status.cmd
   docs\
     README.md                   # repository README

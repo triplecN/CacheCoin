@@ -19,10 +19,15 @@ files before you click "More info", then "Run anyway".
    reasons). The launcher checks every file listed there on each start and
    refuses to run one that does not match. If a program file under bin\ or tor\
    is missing, it refuses to start and tells you to download again.
+   The tools behind "My Keys and Backup.cmd" and "Check Status.cmd" are
+   stricter: they require version.json and refuse to run if any listed program,
+   launcher or tool file is missing or does not match, so a swapped
+   cachecoin-cli.exe cannot read your keys.
    If version.json itself is missing, the launcher warns and runs without
-   verifying (that is only meant for development builds). The real trust anchor
-   is the ZIP hash and the GPG signature you check yourself (step 1 and 2);
-   the launcher cannot prove its own package to you.
+   verifying (that is only meant for development builds), but the tools refuse.
+   None of this catches a fully forged package that replaces version.json too:
+   the real trust anchor is the ZIP hash and the GPG signature you check
+   yourself (step 1 and 2); the launcher cannot prove its own package to you.
 
 4. To verify by hand after unpacking:
 
