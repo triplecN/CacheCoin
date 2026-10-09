@@ -33,8 +33,10 @@ cat SHA256SUMS.txt
 
 if [ -n "${KEY}" ]; then
     command -v gpg >/dev/null 2>&1 || { echo "[!] gpg not installed"; exit 1; }
-    gpg --armor --detach-sign --local-user "${KEY}" SHA256SUMS.txt
-    echo "[+] signature: SHA256SUMS.txt.asc"
+    rm -f SHA256SUMS.txt.asc
+    gpg --yes --armor --detach-sign --local-user "${KEY}" SHA256SUMS.txt
+    gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt || { echo "[!] signature verify failed"; exit 1; }
+    echo "[+] signature: SHA256SUMS.txt.asc (verified)"
 fi
 
 echo
