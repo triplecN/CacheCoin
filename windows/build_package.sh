@@ -17,7 +17,7 @@
 #     [--launcher-dir windows] [--docs-dir windows/docs]
 #
 # Exit status is non-zero if a required input is missing or the zip cannot be
-# produced. Requires bash, coreutils (sha256sum, find, sort, date) and one zip
+# produced. Requires bash, coreutils (sha256sum, find, sort) and one zip
 # backend: zip, python3/python, or powershell.exe (MSYS2 fallback, checked last).
 
 set -euo pipefail
@@ -37,17 +37,21 @@ note() {
 usage() {
     cat <<'EOF'
 usage: bash windows/build_package.sh --bin-dir <dir> --tor-dir <dir> \
-         --version <x.y.z> --out <dir> [--launcher-dir <dir>] [--docs-dir <dir>]
+         --version <x.y.z> --out <dir> [--launcher-dir <dir>] [--docs-dir <dir>] [--gui-dir <dir>]
 
   --bin-dir       directory containing cachecoind.exe and cachecoin-cli.exe
   --tor-dir       directory containing tor.exe, or the extracted Tor Expert
                   Bundle root (which contains tor/, data/ and docs/)
   --version       package version, x.y.z (a leading "v" is accepted and stripped)
   --out           output directory; the package directory and zip are created here
-  --launcher-dir  directory containing CacheCoin.cmd and launcher/CacheCoin.ps1
+  --launcher-dir  directory containing launcher/CacheCoin.ps1 and the entry-point .cmd files
                   (default: the directory this script lives in)
   --docs-dir      directory with the package documentation
                   (default: <launcher-dir>/docs)
+  --gui-dir       optional: the GUI build directory containing CacheCoin.exe and
+                  licenses/. The exe and its "CacheCoin App.cmd" shim go into the
+                  package root, so both are covered by version.json and
+                  SHA256SUMS.windows.txt.
 
 The script writes only under --out. version.json and SHA256SUMS.windows.txt
 are written into the package root; SHA256SUMS.windows.txt.asc is produced
@@ -64,6 +68,7 @@ VERSION=""
 OUT=""
 LAUNCHER_DIR="$SCRIPT_DIR"
 DOCS_DIR="$SCRIPT_DIR/docs"
+GUI_DIR=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -97,6 +102,11 @@ while [ "$#" -gt 0 ]; do
             DOCS_DIR="$2"
             shift 2
             ;;
+        --gui-dir)
+            [ "$#" -ge 2 ] || die "--gui-dir needs a value"
+            GUI_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -112,7 +122,7 @@ done
 [ -n "$VERSION" ] || die "--version is required (try --help)"
 [ -n "$OUT" ] || die "--out is required (try --help)"
 
-for tool in sha256sum find sort sed awk tr date cat cp mkdir rm wc basename dirname; do
+for tool in sha256sum find sort sed awk tr cat cp mkdir rm wc basename dirname; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 
@@ -144,13 +154,14 @@ else
     die "tor.exe not found: expected $TOR_DIR/tor.exe or $TOR_DIR/tor/tor.exe"
 fi
 [ -f "$LAUNCHER_DIR/launcher/CacheCoin.ps1" ] || die "missing launcher: $LAUNCHER_DIR/launcher/CacheCoin.ps1"
-[ -f "$LAUNCHER_DIR/CacheCoin.cmd" ] || die "missing launcher shim: $LAUNCHER_DIR/CacheCoin.cmd"
-[ -f "$LAUNCHER_DIR/tools/CacheCoin-Keys.ps1" ] || die "missing keys tool: $LAUNCHER_DIR/tools/CacheCoin-Keys.ps1"
+[ -f "$LAUNCHER_DIR/tools/CacheCoin-NewWallet.ps1" ] || die "missing keys tool: $LAUNCHER_DIR/tools/CacheCoin-NewWallet.ps1"
+[ -f "$LAUNCHER_DIR/tools/CacheCoin-Package.ps1" ] || die "missing package tool: $LAUNCHER_DIR/tools/CacheCoin-Package.ps1"
 [ -f "$LAUNCHER_DIR/tools/CacheCoin-Status.ps1" ] || die "missing status tool: $LAUNCHER_DIR/tools/CacheCoin-Status.ps1"
+[ -f "$LAUNCHER_DIR/tools/CacheCoin-Verify.ps1" ] || die "missing verify tool: $LAUNCHER_DIR/tools/CacheCoin-Verify.ps1"
 [ -f "$LAUNCHER_DIR/Start Node.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Start Node.cmd"
 [ -f "$LAUNCHER_DIR/Start Mining.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Start Mining.cmd"
 [ -f "$LAUNCHER_DIR/Check Status.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Check Status.cmd"
-[ -f "$LAUNCHER_DIR/My Keys and Backup.cmd" ] || die "missing entry point: $LAUNCHER_DIR/My Keys and Backup.cmd"
+[ -f "$LAUNCHER_DIR/Create New Wallet.cmd" ] || die "missing entry point: $LAUNCHER_DIR/Create New Wallet.cmd"
 
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 TOR_DIR="$(cd "$TOR_DIR" && pwd)"
@@ -161,7 +172,6 @@ OUT="$(cd "$OUT" && pwd)"
 [ "$OUT" != "/" ] || die "--out must not be the filesystem root"
 
 PATCH_FP="$(cat -- "${PATCHES[@]}" | sha256sum | awk '{print $1}')"
-BUILT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 PKG_NAME="CacheCoin-Windows-$VERSION"
 PKG="$OUT/$PKG_NAME"
@@ -171,18 +181,30 @@ rm -rf -- "$PKG"
 rm -f -- "$ZIP"
 mkdir -p -- "$PKG/bin" "$PKG/tor" "$PKG/launcher" "$PKG/docs"
 
-cp -- "$BIN_DIR/cachecoind.exe" "$PKG/bin/cachecoind.exe"
-cp -- "$BIN_DIR/cachecoin-cli.exe" "$PKG/bin/cachecoin-cli.exe"
-# The CI bin directory also carries the MinGW runtime/library DLLs the
-# executables load; ship them next to the exes. The artifact's own
-# SHA256SUMS.txt is not part of the package.
+# Shipped when present, so a fresh build reproduces the published file set.
+if [ -f "$LAUNCHER_DIR/README-Windows.txt" ]; then
+    cp -- "$LAUNCHER_DIR/README-Windows.txt" "$PKG/README-Windows.txt"
+fi
+if [ -f "$LAUNCHER_DIR/PROVENANCE.txt" ]; then
+    cp -- "$LAUNCHER_DIR/PROVENANCE.txt" "$PKG/PROVENANCE.txt"
+fi
+if [ -f "$LAUNCHER_DIR/TOR-PIN.txt" ]; then
+    cp -- "$LAUNCHER_DIR/TOR-PIN.txt" "$PKG/TOR-PIN.txt"
+fi
+
+# The executables are statically linked: the bin directory must contain the
+# two exes (and optionally the CI artifact's own SHA256SUMS.txt). Anything else
+# is a build regression; refuse to ship an unexplained file instead of copying
+# it.
 for f in "$BIN_DIR"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
-        cachecoind.exe|cachecoin-cli.exe|SHA256SUMS.txt) continue ;;
+        cachecoind.exe|cachecoin-cli.exe|SHA256SUMS.txt) ;;
+        *) die "unexpected file in --bin-dir: $(basename "$f") (the Windows build must be statically linked)" ;;
     esac
-    cp -- "$f" "$PKG/bin/"
 done
+cp -- "$BIN_DIR/cachecoind.exe" "$PKG/bin/cachecoind.exe"
+cp -- "$BIN_DIR/cachecoin-cli.exe" "$PKG/bin/cachecoin-cli.exe"
 
 if [ "$TOR_MODE" = "bundle" ]; then
     cp -R -- "$TOR_DIR/tor"/. "$PKG/tor/"
@@ -196,9 +218,9 @@ if [ -z "$(find "$PKG/tor" -maxdepth 2 -type f \( -iname 'license*' -o -iname 'c
 fi
 
 cp -R -- "$LAUNCHER_DIR/launcher"/. "$PKG/launcher/"
-for f in "$LAUNCHER_DIR"/*.cmd; do
-    [ -f "$f" ] || continue
-    cp -- "$f" "$PKG/$(basename "$f")"
+for f in "Start Node.cmd" "Start Mining.cmd" "Check Status.cmd" "Create New Wallet.cmd" "Verify Download.cmd"; do
+    [ -f "$LAUNCHER_DIR/$f" ] || die "missing entry point: $LAUNCHER_DIR/$f"
+    cp -- "$LAUNCHER_DIR/$f" "$PKG/$f"
 done
 mkdir -p -- "$PKG/tools"
 cp -R -- "$LAUNCHER_DIR/tools"/. "$PKG/tools/"
@@ -211,15 +233,30 @@ for f in README.md SECURITY.md; do
 done
 cp -- "$REPO_ROOT/LICENSE" "$PKG/LICENSE"
 
+if [ -n "$GUI_DIR" ]; then
+    [ -f "$GUI_DIR/CacheCoin.exe" ] || die "--gui-dir has no CacheCoin.exe: $GUI_DIR"
+    cp -- "$GUI_DIR/CacheCoin.exe" "$PKG/CacheCoin.exe"
+    printf '@echo off\r\nif not exist "%%~dp0CacheCoin.exe" (\r\n  echo CacheCoin.exe is missing. Download the package again.\r\n  pause\r\n  exit /b 1\r\n)\r\nstart "" "%%~dp0CacheCoin.exe"\r\nexit /b %%ERRORLEVEL%%\r\n' > "$PKG/CacheCoin App.cmd"
+    if [ -d "$GUI_DIR/licenses" ]; then
+        mkdir -p -- "$PKG/docs/licenses"
+        cp -R -- "$GUI_DIR/licenses"/. "$PKG/docs/licenses/"
+    fi
+fi
+
+# Refuse to ship wallet material or secret-looking files from the source directories.
+if [ -d "$PKG/Wallet" ]; then die "the staged package contains a Wallet/ folder"; fi
+bad="$(find "$PKG" -type f \( -iname '*.key' -o -iname '*.bak' -o -iname '*.pfx' -o -iname '*.pem' -o -iname '*.cookie' -o -iname 'id_rsa*' -o -iname '*.wallet' \) -print | head -5)"
+[ -z "$bad" ] || die "the staged package contains secret-looking files: $bad"
+
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 package_files() {
     ( cd "$PKG" && find . -type f \
-        ! -name 'version.json' \
-        ! -name 'SHA256SUMS.windows.txt' \
-        ! -name 'SHA256SUMS.windows.txt.asc' \
+        ! -path './version.json' \
+        ! -path './SHA256SUMS.windows.txt' \
+        ! -path './SHA256SUMS.windows.txt.asc' \
         | LC_ALL=C sort | sed 's|^\./||' )
 }
 
@@ -233,7 +270,6 @@ total="$(package_files | wc -l | tr -d ' ')"
 {
     printf '{\n'
     printf '  "package_version": "%s",\n' "$(json_escape "$VERSION")"
-    printf '  "built_utc": "%s",\n' "$BUILT_UTC"
     printf '  "base_pins": {\n'
     printf '    "bitcoin": "%s",\n' "$BITCOIN_PIN"
     printf '    "randomx": "%s"\n' "$RANDOMX_PIN"
@@ -258,8 +294,8 @@ SUM_FILES=()
 while IFS= read -r rel; do
     SUM_FILES+=("$rel")
 done < <( cd "$PKG" && find . -type f \
-    ! -name 'SHA256SUMS.windows.txt' \
-    ! -name 'SHA256SUMS.windows.txt.asc' \
+    ! -path './SHA256SUMS.windows.txt' \
+    ! -path './SHA256SUMS.windows.txt.asc' \
     | LC_ALL=C sort | sed 's|^\./||' )
 
 ( cd "$PKG" && sha256sum -- "${SUM_FILES[@]}" > SHA256SUMS.windows.txt )

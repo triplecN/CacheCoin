@@ -1,0 +1,101 @@
+CacheCoin (CCCN) Windows package - provenance of every file
+===========================================================
+
+This file says where each file in this package came from and how to check it.
+No file here is anonymous. A file not covered by this document is a defect;
+report it as described in SECURITY.md.
+
+The package version and the SHA-256 of every packaged file are in version.json.
+SHA256SUMS.windows.txt lists the same hashes as text, and
+SHA256SUMS.windows.txt.asc is the offline GPG signature over that list.
+
+How to verify
+-------------
+1. Run "Verify Download.cmd". It checks version.json, every file hash and the
+   checksum list, and the release signature when the .asc file is available
+   (it looks in the package folder and in the folder above it) and GnuPG is
+   installed. When the signature cannot be checked it says so instead of
+   claiming authenticity.
+2. Or by hand:
+       sha256sum -c SHA256SUMS.windows.txt
+       gpg --verify SHA256SUMS.windows.txt.asc SHA256SUMS.windows.txt
+   The release key fingerprint is published with the release (see VERIFY.txt).
+3. The launcher checks version.json on every start and refuses to run when a
+   listed file is missing, modified, or when a program file is not listed.
+4. The strongest source anchor is the patch fingerprint below: it identifies
+   the exact consensus source this package was built from.
+
+Built by this project's CI from pinned source
+---------------------------------------------
+bin\cachecoind.exe, bin\cachecoin-cli.exe
+  Built by .github/workflows/build.yml (job "windows-build") from:
+    - Bitcoin Core v31.1, commit 9be056a8a72b624dae9623b2f7bded92c2a21c91
+    - the CacheCoin patch series in patches/, fingerprint
+      6a89aa144620ea2c019f2678ea80ae8b2de45544bc64d871cd3bb2fefcf1ddda
+    - RandomX, commit 7607fb2faed24d5a679e139a9828d194bbc644a4
+  They are renamed and their Windows resources (icon, description) rewritten by
+  scripts/brand_windows_exe.ps1; that step changes no code and no consensus
+  behavior. They link their libraries (SQLite, Boost, libevent, the MinGW
+  runtime) statically: objdump lists only Windows system DLLs, and this package
+  ships no third-party DLL. License: MIT (see LICENSE). doc/build-windows.md
+  documents how to build them yourself. The build is not bit-for-bit
+  reproducible, so compare the patch fingerprint, not the binary hash, when you
+  rebuild. Their PE header time is 1970-01-01: the linker is told to omit the
+  timestamp (see doc/build-windows.md).
+
+CacheCoin.exe (the window; present when the package was built with the GUI)
+  Built from the CacheCoin GUI source tree with build.sh (Linux/macOS) or
+  build_det.ps1 (Windows). Both use the Roslyn compiler with -deterministic;
+  two consecutive runs of build_det.ps1 produced a byte-identical file for the
+  packaged build. Its PE header time is a content-derived value, not a build
+  timestamp. License: MIT; the embedded fonts are under the SIL Open Font
+  License (texts in docs\licenses\).
+
+Text files from this repository (MIT)
+-------------------------------------
+launcher\CacheCoin.ps1, tools\*.ps1, the .cmd entry points, docs\**,
+README-Windows.txt, LICENSE, TOR-PIN.txt. They ship as readable source; the
+NewWallet tool compiles a small embedded C# helper at runtime (Add-Type).
+docs\README.md and docs\SECURITY.md are copies of the repository root files,
+placed there by the package builder. docs\licenses\ carries the license texts
+of the bundled third-party components (Bitcoin Core, RandomX, Tor, libevent,
+OpenSSL, zlib, Boost, the pluggable transports, and the two fonts).
+
+Third-party files, identified
+-----------------------------
+tor\**
+  The Tor Expert Bundle from https://www.torproject.org/download/tor/.
+  The tor.exe in this package reports version 0.4.9.13 (git-3c575400909efe65).
+  Licenses: tor is 3-clause BSD per tor\docs\tor.txt; the binary's own banner
+  prints the GNU GPL, an upstream inconsistency. tor\docs\ also carries the
+  license texts of the bundled components: libevent (BSD 3-clause), OpenSSL
+  (Apache 2.0), zlib, and of the pluggable transports lyrebird and
+  conjure-client (multi-license Go dependency lists). tor\data\geoip* is the
+  IPFire Location Database (CC BY-SA 4.0).
+  Pinned: Expert Bundle 15.0.24 (tor 0.4.9.13), archive
+  tor-expert-bundle-windows-x86_64-15.0.24.tar.gz, sha256
+  e9dc6ccc93cd6afa507193f4de284d6424233ff5102155cd2c94b259e8a22b65, signed by
+  Tor Browser Developers <torbrowser@torproject.org>, key
+  EF6E286DDA85EA2A4BA7DE684E2C6E8793298290. Every file under tor\ matches that
+  archive byte for byte; see TOR-PIN.txt.
+
+Generated files
+---------------
+version.json and SHA256SUMS.windows.txt are written by windows\build_package.sh.
+SHA256SUMS.windows.txt.asc is created offline with the release GPG key and is
+published next to the ZIP, not inside it. PROVENANCE.txt is this document.
+
+Build metadata and honesty notes
+--------------------------------
+- PE header times in this package: the node executables carry 1970-01-01 (the
+  linker omits the timestamp); CacheCoin.exe carries a content-derived value;
+  the Tor executables are normalized by the Tor Project (1970-01-01). No
+  packaged file's content carries the packager's local time. ZIP entry
+  timestamps depend on the zip tool used at release time; the detached
+  signature carries its creation date.
+- Bit-for-bit reproducibility is not implemented for the node executables.
+  The GUI executable is deterministic.
+- Known gaps: the MinGW-w64 runtime is statically linked into the executable
+  and its license text is not redistributed in the package (the pluggable
+  transports' multi-license lists ship inside the Tor bundle's own text
+  files).

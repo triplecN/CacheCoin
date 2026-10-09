@@ -1,8 +1,7 @@
 {
   "comment": {
-    "about": "Schema of windows/version.json as written by windows/build_package.sh. The real file has no comment field; everything else here is an example.",
+    "about": "Illustrative schema of windows/version.json as written by windows/build_package.sh. The real file has no comment field and lists EVERY packaged file (tens of entries); the short list below only shows the shape. Everything here is an example.",
     "package_version": "The x.y.z version of this package, matching the CacheCoin-Windows-<version>.zip file name. The build script accepts a leading v and strips it.",
-    "built_utc": "UTC time the package was assembled, format YYYY-MM-DDTHH:MM:SSZ. Informational only; it is not part of any checksum input except through this file's own hash.",
     "base_pins.bitcoin": "Bitcoin Core base commit. Must be 9be056a8a72b624dae9623b2f7bded92c2a21c91 for this release line.",
     "base_pins.randomx": "RandomX commit. Must be 7607fb2faed24d5a679e139a9828d194bbc644a4 for this release line.",
     "patch_fingerprint": "sha256 of the concatenated patches/*.patch of the tree the package was built from (cat patches/*.patch | sha256sum). Compare it with doc/verification.md before trusting a build.",
@@ -10,26 +9,27 @@
     "signature": "This directory does not sign anything. SHA256SUMS.windows.txt is signed offline with the release GPG key, producing SHA256SUMS.windows.txt.asc. See windows/README.md and doc/release.md."
   },
   "package_version": "0.1.0",
-  "built_utc": "YYYY-MM-DDTHH:MM:SSZ",
   "base_pins": {
     "bitcoin": "9be056a8a72b624dae9623b2f7bded92c2a21c91",
     "randomx": "7607fb2faed24d5a679e139a9828d194bbc644a4"
   },
   "patch_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
   "files": {
-    "CacheCoin.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
     "Check Status.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
+    "PROVENANCE.txt": "0000000000000000000000000000000000000000000000000000000000000000",
+    "Verify Download.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
     "LICENSE": "0000000000000000000000000000000000000000000000000000000000000000",
-    "My Keys and Backup.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
+    "Create New Wallet.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
     "Start Mining.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
     "Start Node.cmd": "0000000000000000000000000000000000000000000000000000000000000000",
     "bin/cachecoin-cli.exe": "0000000000000000000000000000000000000000000000000000000000000000",
     "bin/cachecoind.exe": "0000000000000000000000000000000000000000000000000000000000000000",
     "docs/README.md": "0000000000000000000000000000000000000000000000000000000000000000",
     "launcher/CacheCoin.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
-    "tools/CacheCoin-Keys.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
+    "tools/CacheCoin-NewWallet.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
     "tools/CacheCoin-Package.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
     "tools/CacheCoin-Status.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
+    "tools/CacheCoin-Verify.ps1": "0000000000000000000000000000000000000000000000000000000000000000",
     "tor/tor.exe": "0000000000000000000000000000000000000000000000000000000000000000"
   }
 }
