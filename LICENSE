@@ -20,7 +20,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
---------------------------------------------------------------------------------
+
 Third-party code used by this project (see README.md):
 
 - Bitcoin Core, Copyright (c) 2009-2026 The Bitcoin Core developers,
@@ -29,4 +29,4 @@ Third-party code used by this project (see README.md):
   (scripts/build_linux.sh) and never redistributed from this repository.
 - RandomX, Copyright (c) 2018-2026 tevador and the Monero Project,
   distributed under the BSD 3-Clause License, fetched likewise at build time.
---------------------------------------------------------------------------------
+
