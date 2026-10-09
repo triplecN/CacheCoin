@@ -187,19 +187,19 @@ jobs:
           cp /c/b/build/bin/bitcoind.exe "$BIN/cachecoind.exe"
           cp /c/b/build/bin/bitcoin-cli.exe "$BIN/cachecoin-cli.exe"
           ls -la "$BIN"
-      - name: Brand the executables (CacheCoin name + logo)
-        # Resource-only: Task Manager shows CacheCoin instead of the upstream Bitcoin Core
-        # strings. This does not touch code or consensus bytes; the patch fingerprint is
+      - name: Set the product name and icon on the executables
+        # Resource-only: Task Manager and Explorer show the project's product name and icon.
+        # This does not touch code or consensus bytes; the patch fingerprint is
         # unchanged. The binaries are already stripped and timestamp-neutral (linker flags).
         shell: pwsh
         run: |
           pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoind.exe" -Icon assets\logo.ico -FileDescription "CacheCoin node (cachecoind)" -OriginalFilename "cachecoind.exe"
           pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoin-cli.exe" -Icon assets\logo.ico -FileDescription "CacheCoin RPC client (cachecoin-cli)" -OriginalFilename "cachecoin-cli.exe"
-      - name: Assert the brand rewriting took effect
-        # The step above must actually rewrite the VERSIONINFO resources. A
-        # green job with unbranded binaries is the failure this asserts
-        # against: the package advertises CacheCoin in Task Manager and
-        # Explorer, and a package that says so in PROVENANCE.txt must carry it.
+      - name: Assert the product metadata took effect
+        # The step above must actually set the product name and icon on the
+        # executables. A green job whose binaries still carry the upstream
+        # version resources is the failure this asserts against: the package
+        # says in PROVENANCE.txt that it carries the project's metadata.
         shell: pwsh
         run: |
           $bad = @()
@@ -210,8 +210,8 @@ jobs:
               $bad += "$name ProductName='$($v.ProductName)' FileDescription='$($v.FileDescription)'"
             }
           }
-          if ($bad.Count -gt 0) { Write-Error ("branding missing: " + ($bad -join '; ')); exit 1 }
-          Write-Output "branding verified: CacheCoin VERSIONINFO on both node executables"
+          if ($bad.Count -gt 0) { Write-Error ("product metadata missing: " + ($bad -join '; ')); exit 1 }
+          Write-Output "product metadata verified on cachecoind.exe and cachecoin-cli.exe"
       - name: Assert static runtime and test the packaged folder with a clean PATH
         # Two checks the old job lacked:
         # 1. No imported DLL may exist in /mingw64/bin. The build links SQLite,

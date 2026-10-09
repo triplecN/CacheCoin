@@ -1,7 +1,7 @@
-# Brands a Windows CacheCoin executable: replaces the VERSIONINFO strings (FileDescription,
-# ProductName, CompanyName, ...) and the icon, so Task Manager shows CacheCoin instead of the
-# upstream Bitcoin Core names. Resource-only: no code is touched. Run after the build (CI) or on
-# an existing artifact; the package manifest must be regenerated and re-signed afterwards.
+# Sets the product metadata on a Windows CacheCoin executable: the VERSIONINFO strings
+# (FileDescription, ProductName, CompanyName, ...) and the icon, so Task Manager and Explorer
+# show the project's name and icon. Resource-only: no code is touched. Run after the build (CI)
+# or on an existing artifact; the package manifest must be regenerated and re-signed afterwards.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps1 `

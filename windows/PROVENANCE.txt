@@ -33,10 +33,10 @@ bin\cachecoind.exe, bin\cachecoin-cli.exe
     - the CacheCoin patch series in patches/, fingerprint
       6a89aa144620ea2c019f2678ea80ae8b2de45544bc64d871cd3bb2fefcf1ddda
     - RandomX, commit 7607fb2faed24d5a679e139a9828d194bbc644a4
-  They are renamed and their Windows resources (icon, description) rewritten by
-  scripts/brand_windows_exe.ps1; CI asserts the rewritten VERSIONINFO is present
-  and fails the job otherwise, so a package that says this here carries it. That
-  step changes no code and no consensus behavior. They link their libraries (SQLite, Boost, libevent, the MinGW
+  They are renamed and their product metadata (icon, description) set by
+  scripts/brand_windows_exe.ps1; CI asserts the metadata is present and fails
+  the job otherwise, so a package that says this here carries it. That step
+  changes no code and no consensus behavior. They link their libraries (SQLite, Boost, libevent, the MinGW
   runtime) statically: objdump lists only Windows system DLLs, and this package
   ships no third-party DLL. License: MIT (see LICENSE). doc/build-windows.md
   documents how to build them yourself. The build is not bit-for-bit

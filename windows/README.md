@@ -242,10 +242,10 @@ binaries are outside this repository's automated test suites
 (`doc/build-windows.md`); the CI smoke test starts the node in regtest, mines
 one block and checks the genesis, nothing more.
 
-The two node executables carry CacheCoin resource branding (VERSIONINFO strings
-and icon) applied after the build by `scripts/brand_windows_exe.ps1`, so Task
-Manager and Explorer show CacheCoin instead of the upstream Bitcoin Core names;
-CI asserts the rewritten VERSIONINFO is present and fails the job otherwise.
-That is resource-only — no code and no consensus bytes are touched — and the CI
-smoke test runs the branded binaries. `cachecoind --version` still prints the
-upstream banner text because that is compiled in, not a resource.
+The two node executables carry the project's product metadata (VERSIONINFO
+strings and icon) set after the build by `scripts/brand_windows_exe.ps1`, so
+Task Manager and Explorer show the project's name and icon; CI asserts the
+metadata is present and fails the job otherwise. That is resource-only — no
+code and no consensus bytes are touched — and the CI smoke test runs the same
+binaries. `cachecoind --version` still prints the upstream banner text because
+that is compiled in, not a resource.

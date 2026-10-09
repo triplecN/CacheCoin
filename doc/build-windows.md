@@ -157,10 +157,10 @@ test "$(cli getblockcount)" = "1" && echo "clean-environment wallet test OK"
 cli stop; wait $BPID || true; rm -rf "$D"
 ```
 
-## Branding the executables (optional)
+## Setting the product name and icon (optional)
 
-A hand-built artifact still carries the upstream Bitcoin Core VERSIONINFO strings and no icon,
-so Task Manager shows "bitcoind (...)". Run the resource-only branding step after the build:
+A hand-built artifact still carries the upstream VERSIONINFO strings and no icon, so Task
+Manager shows the upstream project name. Run the resource-only step after the build:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps1 `
@@ -171,10 +171,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps
     -FileDescription "CacheCoin RPC client (cachecoin-cli)" -OriginalFilename "cachecoin-cli.exe"
 ```
 
-It rewrites only resources (no code, no consensus bytes) and must be followed by regenerating the
+It sets only resources (no code, no consensus bytes) and must be followed by regenerating the
 package checksums and signature. The `--version` console banner still prints the upstream project
 strings; that text is compiled in, not a resource. CI applies this step to every Windows build
-before generating the package checksums and asserts the rewritten VERSIONINFO is present
+before generating the package checksums and asserts the metadata is present
 (`.github/workflows/build.yml`).
 
 ## Reproducibility status
