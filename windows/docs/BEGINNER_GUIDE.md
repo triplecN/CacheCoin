@@ -7,14 +7,16 @@ CacheCoin (CCCN) is a small cryptocurrency that runs over Tor. The Windows
 package contains a full node, a wallet and (optionally) a miner. There is no
 company, no support line and no seed phrase. Read the safety rules below.
 
-The package has four double-click files:
+The package has six double-click files:
 
+- `CacheCoin App.cmd` - the window: wallet, mining page (needs `CacheCoin.exe`).
 - `Start Node.cmd` - run the node only (safe default).
-- `Start Mining.cmd` - run the node and mine (it asks for a backup first).
-- `My Keys and Backup.cmd` - save your wallet backup or show your private keys.
+- `Start Mining.cmd` - run the node and mine (it asks how many CPU threads and where the coins go).
+- `Create New Wallet.cmd` - make a new wallet offline (one address and its private key).
 - `Check Status.cmd` - show block, peers and balance.
+- `Verify Download.cmd` - check the package (file list, hashes and signature) before trusting it.
 
-`CacheCoin.cmd` is the classic entry point behind them; it still works.
+The command-line launcher behind them is `launcher\CacheCoin.ps1` (an older `CacheCoin.cmd` was removed). `PROVENANCE.txt` lists where every packaged file came from and how to check it.
 
 ---
 
@@ -54,12 +56,14 @@ does not mine and does not use much CPU.
    minute and it proves the download arrived unchanged.
 3. Right-click the ZIP, choose **Extract All**, and open the extracted folder
    `CacheCoin-Windows-<version>`. Do not run the program from inside the ZIP.
-4. Double-click **Start Node** (the file `Start Node.cmd`). If you prefer the
-   classic way, double-click `CacheCoin` and choose `1) Node only`.
+4. Double-click **Start Node** (the file `Start Node.cmd`).
 5. If Windows shows "Windows protected your PC", click **More info**, then
    **Run anyway**. (This happens because the program has no paid Windows
    signature.)
-6. When asked how to run, type **1** and press Enter: `1) Node only`.
+6. On the first start the launcher asks two yes/no questions: whether to
+   accept incoming Tor connections (press Enter for no) and whether to start
+   CacheCoin automatically when you log in (press Enter for no). `Start Node.cmd`
+   already selects node-only mode, so there is no mode question.
 7. Wait. The window shows the sync progress. When it says
    `Up to date at block ...`, you are done.
 
@@ -74,81 +78,107 @@ attaches to it. To stop it, see Part 6.
 
 ## Part 2 - Start mining (Node + mining mode)
 
-Only start mining if you understand it is a lottery. Before mining can begin,
-you must save and confirm a wallet backup (Part 3); the launcher enforces this
-on purpose, to protect your coins.
+Only start mining if you understand it is a lottery.
 
 1. Double-click **Start Mining** (the file `Start Mining.cmd`). Or open
    PowerShell in the CacheCoin folder and run:
 
    ```
-   CacheCoin.cmd -Mode mining
+   powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -Mode mining
    ```
 
-2. The launcher loads (or creates) your wallet. You do **not** type any address:
-   the wallet automatically creates a modern SegWit address that starts with
-   `cccn1q...`. Mining pays to that address.
-3. The launcher now asks you to save a backup. Follow Part 3.
-4. After the backup is confirmed, mining starts. The window shows
-   `Mining: N worker(s)`.
+2. The launcher asks how many processors mining should use (type a number, or
+   press Enter for a small recommended number). The rule:
+   - a number below what this computer can run is used as typed;
+   - typing exactly the maximum uses every processor;
+   - a number above the maximum is capped to maximum-1 (leaving one for
+     Windows; on a single-core computer the count stays at 1).
+   More processors mine faster and make the computer hotter and louder.
+
+3. Next it asks where the mined coins should go:
+   - type **1** to use a wallet from the `Wallet` folder (made with
+     `Create New Wallet.cmd`; the newest `.txt` file is used);
+   - type **2** to paste your own modern segwit address (it starts with
+     `cccn1`). The node checks the address, then shows it and asks you to press
+     Enter to confirm. **A wrong address cannot be undone.** If it is an
+     exchange address, the exchange must credit you.
+
+4. Mining starts. The window shows `Mining: N worker(s)`.
+
+Mining is a package: your computer runs a full node, mines, and also serves as
+a peer. It publishes its own onion address and accepts incoming Tor connections
+so other nodes can sync from it; that is what keeps the network alive without
+depending on one server. Tor still hides your IP, but the node's onion address
+is public, like any peer. Total connections are capped at 32 (incoming plus
+outgoing) and the node serves at most about 5 GB per day, so it stays light.
+
+Mining does not use or change the node's own wallet, so no wallet backup is
+needed just to mine. Back up the wallet that receives the coins (Part 3).
 
 The mode is remembered. The next time, double-clicking **Start Mining** starts
-mining again. To go back to node-only, double-click **Start Node** once.
+mining again (the launcher asks again; the saved answers are used only when the
+node starts automatically in the background).
+To go back to node-only, double-click **Start Node** once.
 
-If you want a fresh receive address at any time:
-
-```
-.\bin\cachecoin-cli.exe -rpcwallet=main getnewaddress
-```
+To see where the coins go later, open
+`%APPDATA%\CacheCoin\logs\launcher.log` and search for `Mining address:`.
 
 ---
 
 ## Part 3 - Save your wallet backup (the most important step)
 
-The launcher asks for this before mining. It saves two files to the folder you
-choose:
+A backup is needed for any wallet that holds coins. Mining does not use or
+change the node's own wallet, so the launcher does not ask for a backup before
+mining. The wallets you can have:
 
-- `cachecoin-main-wallet-<date>.bak` - the wallet file.
-- `cachecoin-main-descriptors-<date>.json` - the keys, in text form.
+- **Create New Wallet.cmd** saves one address and its private key to
+  `Wallet\cachecoin-wallet-<date>.txt` (option 1). Copy that file to a USB
+  stick or another disk, not the same disk as the program. Option 2 shows the
+  key on screen instead: write it down.
+- **The CacheCoin App** (the window) has its own wallet `main` with a backup
+  page. Use it if you keep coins there.
+- The command-line wallet `main` (used by `cachecoin-cli`) is backed up with
+  the manual commands in `docs\BACKUP.txt`.
 
-Either file can restore your wallet on its own. Then the launcher asks you to
-type a confirmation sentence. Until that sentence is saved, mining does not
-start, including after a reboot.
+Rules:
 
-Choose a USB stick or another disk - **not** the same disk as the program.
-After saving, unplug the USB and keep it somewhere safe. Do not leave the only
-copy in a cloud-synced folder.
-
-If you receive more coins later, make a fresh backup. The easy way is to
-double-click **My Keys and Backup** and choose option 1; it saves the same two
-files and prints their sha256 values. The exact manual commands are in
-`docs\BACKUP.txt`, which also contains the tested restore procedure.
+- Anyone who has the wallet file, the WIF or the private key can take the
+  coins. Treat them like cash.
+- Save backups offline: a USB stick or another disk, not the same disk as the
+  program. Never email, chat or cloud-sync them.
+- If you receive more coins later, make a fresh backup.
+- There is no seed phrase and no recovery service. Test your restore before
+  you need it; the tested steps are in `docs\BACKUP.txt`.
 
 ---
 
-## Part 4 - Print your private keys (advanced, optional)
+## Part 4 - Create a new wallet offline (advanced, optional)
 
-You usually do not need this. The backup files from Part 3 are enough. Read the
-warnings before you do it.
+**Create New Wallet.cmd** makes a brand-new single key offline: no node and no
+internet are needed. You get one modern segwit address (`cccn1...`), its private
+key, the WIF and the public key. Option 1 saves everything to a `.txt` file in a
+`Wallet` folder next to the program; option 2 shows it on screen so you can copy
+it down. You can make as many wallets as you want.
 
-**WARNING: anyone who sees these keys can take your coins. There is no undo.**
+To open such a wallet in CacheCoin: first screen -> "Forgot your password?" ->
+"From a private key" -> paste the WIF -> choose a password. One key restores one
+address only; use a recovery file from the CacheCoin App when you have one.
 
-The easy way: double-click **My Keys and Backup** and choose option 2. It warns
-you, asks you to turn the internet off, asks you to type a confirmation phrase,
-shows the keys, and clears the screen when you are done. It never writes the
-keys to a log file.
+**WARNING: anyone who sees the private key or the WIF can take those coins.
+There is no undo.** Keep the file or the paper offline.
 
-The manual way:
+To print the keys of the wallet the node already has (advanced):
 
 1. Open PowerShell in the CacheCoin folder.
-2. Run:
+2. An encrypted wallet must be unlocked first (`walletpassphrase`), then run:
 
    ```
    .\bin\cachecoin-cli.exe -rpcwallet=main listdescriptors true
    ```
 
-3. The output is JSON. The strings that start with `xprv...` are your private
-   keys. The launcher's `descriptors.json` backup contains the same information.
+3. The output is JSON. The strings that start with `2EQ` (`tprv` on a test
+   build) are your private keys. The CacheCoin App's recovery file (or the manual
+   backup in `docs\BACKUP.txt`) contains the same information.
 
 Rules for these keys:
 
@@ -198,19 +228,19 @@ computer only (localhost); do not expose it to the internet.
 - No window or tray (automatic start at login):
 
   ```
-  CacheCoin.cmd -Stop
+  powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -Stop
   ```
 
 - Stop it from starting at login:
 
   ```
-  CacheCoin.cmd -DisableAutostart
+  powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -DisableAutostart
   ```
 
 - Turn the login start back on:
 
   ```
-  CacheCoin.cmd -EnableAutostart
+  powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -EnableAutostart
   ```
 
 Never delete the data folder while the node is running.
@@ -232,11 +262,14 @@ Nobody can say. Solo mining is a lottery. It can be weeks, or never. Check
 `Blocks found` in the launcher window.
 
 **"The balance says `wallet not loaded`. Where are my coins?"**
-You are running Node only mode. Mining mode loads the wallet and shows the
-balance. Run `CacheCoin.cmd -Mode mining` (it will ask for a backup first).
+Node only mode does not load a wallet, so there is no balance to show. The
+CacheCoin App loads its own wallet when it is open. If you mine to a Wallet
+folder address (Create New Wallet.cmd), the coins belong to that address, not
+to this node's wallet; to see or spend them, open the WIF in the app via
+"Forgot your password?" -> "From a private key".
 
 **"My clock is wrong. Does it stop mining?"**
-No. The launcher only warns. If Windows time is wrong by more than 10 minutes,
+No. The launcher only warns. If Windows time is wrong by more than 5 minutes,
 a block you find can be rejected by the network, so fix your clock anyway:
 Settings > Time & Language > Date & time > Sync now.
 
@@ -255,4 +288,4 @@ localhost. Still, never share your wallet files or private keys.
 - `docs\START_HERE.txt` - short version of this guide.
 - `docs\BACKUP.txt` - backup and tested restore commands.
 - `docs\VERIFY.txt` - check the download and the signatures.
-- `docs\SECURITY.md` - security notes for this software.
+- `docs\SECURITY.md` - security notes; its "The Windows package" section lists the accepted limits.

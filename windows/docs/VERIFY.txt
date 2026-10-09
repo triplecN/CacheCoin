@@ -12,26 +12,35 @@ files before you click "More info", then "Run anyway".
 2. The release also publishes SHA256SUMS.windows.txt and a detached GPG
    signature (SHA256SUMS.windows.txt.asc). If you have the project's public
    key, verify the signature; the hashes alone prove only that the download
-   was not corrupted in transit.
+   was not corrupted in transit. On Windows, install Gpg4win and run:
+     gpg --import release-key.asc   # get this file from the repository root; it is not inside the ZIP
+     gpg --verify SHA256SUMS.windows.txt.asc SHA256SUMS.windows.txt
 
 3. Inside the ZIP, version.json lists the SHA-256 of the packaged files
    (version.json itself and the checksum files are not listed, for obvious
    reasons). The launcher checks every file listed there on each start and
-   refuses to run one that does not match. If a program file under bin\ or tor\
-   is missing, it refuses to start and tells you to download again.
-   The tools behind "My Keys and Backup.cmd" and "Check Status.cmd" are
-   stricter: they require version.json and refuse to run if any listed program,
-   launcher or tool file is missing or does not match, so a swapped
-   cachecoin-cli.exe cannot read your keys.
-   If version.json itself is missing, the launcher warns and runs without
-   verifying (that is only meant for development builds), but the tools refuse.
+   refuses to run one that does not match, refuses to run when version.json is
+   missing, and refuses to run when any program (.exe, .dll, .ps1, .cmd, .bat
+   and similar) in the folder is not listed there at all. Any listed file that
+   is missing is refused too, documents included. The tools behind "Create New
+   Wallet.cmd" and "Check Status.cmd" apply the same rule.
    None of this catches a fully forged package that replaces version.json too:
    the real trust anchor is the ZIP hash and the GPG signature you check
-   yourself (step 1 and 2); the launcher cannot prove its own package to you.
+   yourself (steps 1 and 2); the launcher cannot prove its own package to you.
+   The release signing key fingerprint is
+   7D85 B6F3 64CC 47BA 9209 BB54 F750 900C 7C91 1728.
 
 4. To verify by hand after unpacking:
 
    Get-ChildItem -Recurse -File | Get-FileHash -Algorithm SHA256
+
+5. Or double-click "Verify Download.cmd": it performs step 3 and the checksum
+   list in step 2 for you, checks the GPG signature when Gpg4win is installed
+   and SHA256SUMS.windows.txt.asc is available (the release publishes it next
+   to the ZIP; the verifier also looks in the folder above the package), and
+   points to PROVENANCE.txt, which lists the origin of every packaged file.
+   When the signature cannot be checked it says so instead of claiming
+   authenticity.
 
 If any hash differs from the published one, delete the download and get a
 fresh copy from the official source. Do not run it.

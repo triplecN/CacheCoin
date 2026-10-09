@@ -7,32 +7,45 @@ step-by-step instructions in plain English, including backups and private keys.
 CacheCoin is a small, Tor-only cryptocurrency. This folder runs a full node,
 and optionally mines on your CPU.
 
-The four double-click files:
+The six double-click files:
+  CacheCoin App.cmd        the window (wallet, mining page; needs CacheCoin.exe)
   Start Node.cmd           run the node only (safe default)
-  Start Mining.cmd         run the node and mine (asks for a backup first)
-  My Keys and Backup.cmd   save a wallet backup, or show your private keys
+  Start Mining.cmd         run the node and mine (asks how many CPU threads and where the coins go)
+  Create New Wallet.cmd    make a new wallet offline (one address and its private key)
   Check Status.cmd         show block, peers and balance
-(CacheCoin.cmd is the classic entry point behind them; it still works.)
+  Verify Download.cmd      check the package hashes and file list before you trust it
+The command-line launcher is launcher\CacheCoin.ps1. (Older builds also shipped CacheCoin.cmd; it has been removed.)
 
-1. Double-click Start Node.cmd (or CacheCoin.cmd and choose "Node only").
+1. Double-click Start Node.cmd.
 2. Choose mining only if you want it. Mining is a lottery: you may find a
-   block, you may not. There is no guaranteed reward.
+   block, you may not. There is no guaranteed reward. Mining also makes this
+   computer a peer (it accepts incoming Tor connections), so the network does
+   not depend on one server; a connection and upload cap keeps it light.
 3. The first start can take a few minutes; the node syncs over Tor.
 4. Your data lives in %APPDATA%\CacheCoin. The log is in logs\launcher.log.
 5. To stop a node that this launcher started: right-click the tray icon and
    choose "Stop CacheCoin". If the launcher attached to a node that was already
-   running, the tray leaves it running; use CacheCoin.cmd -Stop for that.
+   running, the tray leaves it running; stop it with the command in step 6.
    Closing the window can leave the node running (the next start attaches).
 6. If the node runs automatically at login (hidden: no window, no tray), stop
-   it with: CacheCoin.cmd -Stop
-   To stop it starting at login at all: CacheCoin.cmd -DisableAutostart
+   it with: powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -Stop
+   To stop it starting at login at all: powershell -NoProfile -ExecutionPolicy Bypass -File launcher\CacheCoin.ps1 -DisableAutostart
 7. Never delete the data folder while the node is running.
-8. Mining starts only after you save and confirm a backup (see BACKUP.txt).
-   Until then, an automatic start keeps the node running but does not mine.
-   The wallet is checked before mining; if it changed or the backup does not
-   cover it, mining waits for a new backup.
+8. Mining asks two things first: how many processors to use (type a number;
+   Enter uses a small recommended number. If you type more than the computer
+   can run, mining uses one less than its maximum; typing exactly the maximum
+   uses all; anything lower is used as typed), and where the coins go:
+     - a wallet from the Wallet folder (made with Create New Wallet.cmd), or
+     - your own modern segwit address (starts with cccn1), checked by the node
+       and confirmed by you before mining starts.
+   Mining does not use or change the node's own wallet, so no wallet backup is
+   needed just to mine. Back up the wallet that receives the coins (the Wallet
+   folder .txt file, or the wallet in the CacheCoin App); see docs\BACKUP.txt.
+   Mining also serves other nodes as a peer over Tor (capped at 32 connections
+   and about 5 GB uploaded per day). Your IP stays hidden; the node's onion
+   address is public, like any peer.
 
 Tor is required. If Tor is not already running, the bundled copy starts
-automatically. If mining, you MUST save a backup first; see docs\BACKUP.txt.
+automatically. Back up any wallet that will receive coins; see docs\BACKUP.txt.
 
 This software is provided as is, without warranty. It is not financial advice.

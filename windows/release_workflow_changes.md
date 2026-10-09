@@ -122,24 +122,11 @@ file for the chosen release.
             mingw-w64-x86_64-libevent mingw-w64-x86_64-sqlite3
             mingw-w64-x86_64-zeromq python
       # Copy the "Clone pinned sources", "Apply CacheCoin patches in order",
-      # "Build RandomX + node" and "Smoke test" steps from build.yml verbatim.
-      - name: Collect cachecoin-named binaries and their DLLs
-        # build_package.sh copies every file in --bin-dir except the artifact's
-        # own SHA256SUMS.txt, so the MinGW runtime DLLs must be collected here.
-        run: |
-          BIN=/c/b/build/bin-ci
-          mkdir -p "$BIN"
-          cp /c/b/build/bin/bitcoind.exe "$BIN/cachecoind.exe"
-          cp /c/b/build/bin/bitcoin-cli.exe "$BIN/cachecoin-cli.exe"
-          strip --strip-all "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"
-          for exe in "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"; do
-            objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
-              if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" "$BIN/"; fi
-            done
-          done
-          cd "$BIN"
-          ./cachecoind.exe --version
-          sha256sum -- *.exe *.dll > SHA256SUMS.txt
+      # "Build RandomX + node", "Rename the executables", "Brand the
+      # executables" and "Assert static runtime and test the packaged folder
+      # with a clean PATH" steps from build.yml verbatim. They produce
+      # release/bin with the branded, statically linked executables and
+      # SHA256SUMS.txt; nothing is stripped or collected separately.
       - name: Fetch and verify the Tor Expert Bundle
         run: |
           curl -fsSLo tor.tar.gz "$TOR_EXPERT_URL"
@@ -151,12 +138,25 @@ file for the chosen release.
           tar -xzf tor.tar.gz -C tor-expert
           test -f tor-expert/tor/tor.exe
           test -f tor-expert/docs/tor.txt
+      - name: Verify the Tor bundle against the pin
+        # Downloads the pinned archive from windows/TOR-PIN.txt, checks its
+        # sha256, and compares every file with the extracted bundle.
+        run: |
+          bash "$GITHUB_WORKSPACE/windows/verify_tor_bundle.sh" \
+            --tor-dir "$GITHUB_WORKSPACE/tor-expert"
       - name: Assemble the package
         run: |
           mkdir -p "$GITHUB_WORKSPACE/win-release"
+          # --gui-dir must point at a directory containing CacheCoin.exe produced
+          # by the GUI build; omit the flag to ship a package without the window.
+          if [ -n "${{ inputs.attach_windows }}" ] && [ ! -f "$GITHUB_WORKSPACE/gui/CacheCoin.exe" ]; then
+            echo "gui/CacheCoin.exe is missing; drop --gui-dir to ship without the window"
+            exit 1
+          fi
           bash "$GITHUB_WORKSPACE/windows/build_package.sh" \
-            --bin-dir /c/b/build/bin-ci \
+            --bin-dir "$GITHUB_WORKSPACE/release/bin" \
             --tor-dir "$GITHUB_WORKSPACE/tor-expert" \
+            --gui-dir "$GITHUB_WORKSPACE/gui" \
             --version "${GITHUB_REF_NAME#v}" \
             --out "$GITHUB_WORKSPACE/win-release"
       - name: Check the patch fingerprint against the tag
@@ -185,8 +185,10 @@ Notes:
 
 - `--version "${GITHUB_REF_NAME#v}"` strips the leading `v`, matching the
   `x.y.z` requirement of `build_package.sh`.
-- The job requires `windows/launcher/CacheCoin.ps1`, `windows/CacheCoin.cmd` and
-  `windows/docs/` to be committed; `build_package.sh` fails otherwise.
+- The job requires `windows/launcher/CacheCoin.ps1`, the entry-point `.cmd` files and
+  `windows/docs/` to be committed; `build_package.sh` fails otherwise. Without
+  `--gui-dir` the package has no `CacheCoin App.cmd`/`CacheCoin.exe`, which the
+  shipped docs describe.
 - The zip is attached unsigned. `SHA256SUMS.windows.txt.asc` is not produced
   here and must be added offline before publishing.
 - The `if` uses `github.event_name` as well as the input so the job cannot run
@@ -238,3 +240,40 @@ publish binaries from a different commit than the tag. The Windows job is
 mandatory and green now, so this alternative is workable if the run id is
 recorded at tag time; it is left out only to keep the release bound to a
 same-run build.
+
+## Implemented: static SQLite and a packaged-folder test
+
+The Windows build now links SQLite statically and the package carries no
+third-party DLL. What was done and verified locally end to end:
+
+1. `libsqlite3.dll.a` is moved aside before configuring the node build, so
+   CMake resolves `/mingw64/lib/libsqlite3.a` (recorded in `CMakeCache.txt` as
+   `SQLite3_LIBRARY`). No patch or consensus file is touched.
+2. The build sanitizes itself: `-ffile-prefix-map`/`-fmacro-prefix-map` remove
+   absolute build paths from strings, and `-Wl,-s -Wl,--no-insert-timestamp`
+   strip the executables and set the PE header time to 1970-01-01.
+3. The artifact step renames, brands, then asserts: for each executable, no
+   name printed by `objdump -p` may exist in `/mingw64/bin`. The old "collect
+   runtime DLLs" loop is gone; a regression now fails the job.
+4. A clean-environment test runs the packaged folder (with `/mingw64/bin`
+   removed from `PATH`) through create-wallet, get-address and one mined
+   regtest block. This closes the gap where CI could find DLLs through the
+   MSYS2 PATH but a user's machine could not.
+5. `doc/build-windows.md` and `windows/README.md` carry the same steps, and
+   `PROVENANCE.txt` no longer lists `libsqlite3-0.dll`.
+
+Measured result: imports are `ADVAPI32, bcrypt, IPHLPAPI, KERNEL32, msvcrt,
+SHELL32, WS2_32` only; the PE timestamp is 1970-01-01; the clean-PATH wallet
+round-trip passes.
+
+## Release assets and provenance (planned)
+
+For each Windows release, attach: the ZIP, `SHA256SUMS.windows.txt` and the
+detached `.asc`, the raw executables (`cachecoind.exe`, `cachecoin-cli.exe`,
+`CacheCoin.exe`) so they can be hashed without unpacking, `PROVENANCE.txt`,
+`TOR-PIN.txt`, and a `BUILD-INFO.txt` generated by CI with the patch
+fingerprint, base pins, runner image, compiler/toolchain versions,
+`SOURCE_DATE_EPOCH` if used, and the CI run URL. Before packaging, run
+`windows/verify_tor_bundle.sh` against the unpacked bundle. The release notes
+must state the reproducibility status as it is (see the notes template), never
+more.

@@ -13,21 +13,25 @@ directory you choose (use one outside the repository).
 ```
 CacheCoin-Windows-<version>/
   Start Node.cmd                # entry point: run the node only (safe default)
-  Start Mining.cmd              # entry point: run the node and mine (backup first)
-  My Keys and Backup.cmd        # entry point: save a backup or show private keys
+  Start Mining.cmd              # entry point: run the node and mine (asks where the coins go)
+  Create New Wallet.cmd         # entry point: make a new wallet offline
   Check Status.cmd              # entry point: block, peers, balance
-  CacheCoin.cmd                 # the underlying shim; calls launcher\CacheCoin.ps1
+  Verify Download.cmd           # entry point: check the package (hashes, list, signature)
+  PROVENANCE.txt                # where every packaged file came from and how to check it
+  TOR-PIN.txt                   # the pinned Tor Expert Bundle (version, sha256, signing key)
+  launcher\CacheCoin.ps1        # the launcher behind the entry points
   LICENSE                       # MIT, copied from the repository root
+  README-Windows.txt            # plain-language guide for the people running the package
   bin\
-    cachecoind.exe              # from the windows-build CI job
-    cachecoin-cli.exe           # from the windows-build CI job
-    *.dll                       # MinGW runtime/library DLLs the exes load
+    cachecoind.exe              # from the windows-build CI job (statically linked)
+    cachecoin-cli.exe           # from the windows-build CI job (statically linked)
   launcher\
     CacheCoin.ps1               # launcher written for this package
   tools\
-    CacheCoin-Keys.ps1          # script behind My Keys and Backup.cmd
+    CacheCoin-NewWallet.ps1     # script behind Create New Wallet.cmd
     CacheCoin-Package.ps1       # version.json integrity check shared by the tools
     CacheCoin-Status.ps1        # script behind Check Status.cmd
+    CacheCoin-Verify.ps1        # script behind Verify Download.cmd
   docs\
     README.md                   # repository README
     SECURITY.md                 # repository security policy
@@ -38,14 +42,18 @@ CacheCoin-Windows-<version>/
     docs\tor.txt                # Tor license and component licenses
     pluggable_transports\       # as shipped in the bundle
     ...
+  CacheCoin App.cmd             # only with --gui-dir: opens the window
+  CacheCoin.exe                 # only with --gui-dir: the window binary
   version.json                  # pins, patch fingerprint, per-file sha256
   SHA256SUMS.windows.txt        # sha256 of every file above
-  SHA256SUMS.windows.txt.asc    # added offline with the release GPG key
 ```
 
-The structure mirrors `windows\` in the repository: the shim stays at the
-package root and `CacheCoin.ps1` stays in `launcher\`, so the shim's relative
-path to the script is the same in both places.
+The detached signature `SHA256SUMS.windows.txt.asc` is created offline and published next to the
+zip; it is not part of the package.
+
+The structure mirrors `windows\` in the repository: the entry-point `.cmd`
+files sit at the package root and `CacheCoin.ps1` stays in `launcher\`, so
+their relative paths are the same in both places.
 
 ## Prerequisites
 
@@ -55,9 +63,10 @@ path to the script is the same in both places.
   fallback). The script picks one automatically.
 - A repository checkout: `patches/`, `LICENSE`, `README.md` and `SECURITY.md`
   are read from it.
-- `windows\launcher\CacheCoin.ps1`, `windows\CacheCoin.cmd`, the entry-point
-  `.cmd` files (`Start Node.cmd`, `Start Mining.cmd`, `My Keys and Backup.cmd`,
-  `Check Status.cmd`), `windows\tools\` and `windows\docs\`
+- `windows\launcher\CacheCoin.ps1` and the entry-point
+  `.cmd` files (`Start Node.cmd`, `Start Mining.cmd`, `Create New Wallet.cmd`,
+  `Check Status.cmd`, `Verify Download.cmd`), `windows\tools\`, `windows\docs\` and
+  `windows\README-Windows.txt`
   (default `--launcher-dir` / `--docs-dir`).
 
 ## Step 1: get the node binaries from CI
@@ -65,32 +74,37 @@ path to the script is the same in both places.
 1. Open the GitHub Actions run for the commit or signed tag you trust and select
    the `windows-build` job of `.github/workflows/build.yml`.
 2. Confirm the job succeeded. The artifact is only uploaded after the build,
-   the regtest smoke test and the DLL collection all pass; a failed Windows job
-   fails the whole run.
+   the static-runtime assertion and the clean-environment wallet test all
+   pass; a failed Windows job fails the whole run.
 3. Download the artifact `cachecoin-windows` (requires a GitHub login; artifacts
    expire after 90 days). It contains a `bin\` directory with `cachecoind.exe`,
-   `cachecoin-cli.exe`, the MinGW runtime/library DLLs the executables load
-   (the MSYS2 build is dynamically linked), and `SHA256SUMS.txt`.
+   `cachecoin-cli.exe` and `SHA256SUMS.txt`. The executables are statically
+   linked: the folder holds no DLLs.
 4. Unpack it. The `bin` directory is `--bin-dir`; the packaging script copies
-   the exes and the DLLs. The artifact checksums protect the download in
-   transit only; compare `SHA256SUMS.txt` if you want, but the package's own
-   checksums are what you publish.
+   the executables. The artifact checksums protect the download in transit
+   only; compare `SHA256SUMS.txt` if you want, but the package's own checksums
+   are what you publish.
 
 Building the `.exe` files yourself is possible, but outside the automated
 suites; see `doc/build-windows.md`.
 
 ## Step 2: get the Tor Expert Bundle
 
-1. Download the Windows x86_64 Tor Expert Bundle from the Tor Project
-   (https://www.torproject.org/download/tor/).
-2. Verify it against the Tor Project's published checksums and GPG signature
-   before unpacking. This is the only point where the Tor version is pinned;
-   record the version (download page or `tor.exe --version` on Windows) for the
-   release notes.
+1. Download the pinned Windows x86_64 Tor Expert Bundle. The exact archive,
+   sha256 and signing key are in `windows\TOR-PIN.txt` (Expert Bundle 15.0.24,
+   tor 0.4.9.13).
+2. Verify the archive's sha256 and its GPG signature with the key in
+   `TOR-PIN.txt`, then unpack it.
 3. Unpack it. Pass the extracted bundle root as `--tor-dir`; the script also
    accepts a directory that contains `tor.exe` directly. In the bundle layout
    it copies `tor/` to the package's `tor/`, and `data/` and `docs/` (including
    the Tor license, `docs/tor.txt`) into `tor/data` and `tor/docs`.
+
+After unpacking, check the bundle against the pin:
+
+```bash
+bash windows/verify_tor_bundle.sh --tor-dir /path/to/tor-expert-bundle
+```
 
 `version.json` identifies the bundle by the sha256 of every Tor file; there is
 no separate version string in the schema.
@@ -98,7 +112,7 @@ no separate version string in the schema.
 ## Step 3: prepare launcher and docs
 
 Make sure the launcher (`windows\launcher\CacheCoin.ps1` plus the
-`windows\CacheCoin.cmd` shim) and `windows\docs\` exist in the checkout. Both
+`windows\Start Node.cmd` / `windows\Start Mining.cmd` / `windows\Check Status.cmd` / `windows\Create New Wallet.cmd` / `windows\Verify Download.cmd` entry points) and `windows\docs\` exist in the checkout. Both
 directories can be overridden:
 
 ```bash
@@ -117,6 +131,7 @@ From the repository root:
 bash windows/build_package.sh \
     --bin-dir /path/to/cachecoin-windows \
     --tor-dir /path/to/tor-expert-bundle \
+    --gui-dir /path/to/gui-build \
     --version 0.1.0 \
     --out /path/to/output
 ```
@@ -124,7 +139,10 @@ bash windows/build_package.sh \
 A leading `v` is accepted (`--version v0.1.0` becomes `0.1.0`). The script:
 
 - fails if `cachecoind.exe`, `cachecoin-cli.exe`, `tor.exe`, the Tor license,
-  the launcher files or the docs directory are missing;
+  the launcher files or the docs directory are missing; with `--gui-dir` it also
+  requires `CacheCoin.exe` there;
+- with `--gui-dir`, copies `CacheCoin.exe` and generates `CacheCoin App.cmd`;
+  without it the package has no window;
 - copies the launcher, docs, `LICENSE`, `README.md` and `SECURITY.md` (the last
   two into `docs\`, overwriting same-named files already in `--docs-dir`);
 - computes the patch fingerprint as `cat patches/*.patch | sha256sum`;
@@ -143,7 +161,17 @@ sha256sum -c SHA256SUMS.windows.txt
 
 Check that `version.json` reports the expected `patch_fingerprint` (compare
 with `doc/verification.md`), the two base pins, and that `files` lists every
-file. On Windows, hash the zip with:
+file in the package (`sha256sum -c` already covers the same list; this only
+cross-checks the count). The package also carries `Verify Download.cmd`
+(tools\CacheCoin-Verify.ps1) for end users; `PROVENANCE.txt` and `TOR-PIN.txt`
+record where every file came from, and
+
+```bash
+bash windows/verify_tor_bundle.sh --tor-dir <package>\tor
+```
+
+re-checks the Tor pin (downloading the pinned archive when no `--tarball` is
+given). On Windows, hash the zip with:
 
 ```powershell
 Get-FileHash CacheCoin-Windows-0.1.0.zip -Algorithm SHA256
@@ -191,8 +219,10 @@ describes the proposed change and how to keep that default honest.
 - **Clearnet configuration.** The node is Tor-only by default. The repository's
   `config/cachecoin-clearnet.conf` is intentionally not shipped; running over
   clearnet is a deliberate manual choice (`START_HERE.md`).
-- **GUI.** The Windows build is `-DBUILD_GUI=OFF`: `cachecoind` plus
-  `cachecoin-cli` only.
+- **GUI.** The node build is `-DBUILD_GUI=OFF`: `cachecoind` plus
+  `cachecoin-cli` only. The separate Windows window (`CacheCoin.exe`) is built
+  from the GUI sources and, when `build_package.sh` is given `--gui-dir`, is
+  copied into the package and covered by `version.json` and the checksums.
 - **Miners.** No XMRig or any other external miner. The node's built-in
   `generatetoaddress` is light mode only; faster miners have their own licenses
   and are not distributed here.
@@ -211,3 +241,10 @@ one can yet rebuild the exact bytes. Do not claim otherwise. The Windows
 binaries are outside this repository's automated test suites
 (`doc/build-windows.md`); the CI smoke test starts the node in regtest, mines
 one block and checks the genesis, nothing more.
+
+The two node executables carry CacheCoin resource branding (VERSIONINFO strings
+and icon) applied after the build by `scripts/brand_windows_exe.ps1`, so Task
+Manager and Explorer show CacheCoin instead of the upstream Bitcoin Core names.
+That is resource-only — no code and no consensus bytes are touched — and the CI
+smoke test runs the branded binaries. `cachecoind --version` still prints the
+upstream banner text because that is compiled in, not a resource.

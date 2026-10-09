@@ -37,11 +37,28 @@ announcement and in `doc/release.md`. On Windows:
 Get-FileHash CacheCoin-Windows-<version>.zip -Algorithm SHA256
 ```
 
+## Provenance and reproducibility
+
+- Every packaged file is identified in `PROVENANCE.txt` with its source, its
+  license where documented, and how to verify it. `Verify Download.cmd` checks
+  the manifest, all hashes and the signature in one step.
+- The node executables are not bit-for-bit reproducible; compare the patch
+  fingerprint above, not the binary hash, when rebuilding. The GUI executable
+  is built deterministically (`build_det.ps1` / `build.sh`; two consecutive
+  runs of `build_det.ps1` produced a byte-identical file for the packaged
+  build).
+- Build environment for this release: `<toolchain and CI runner>` (fill in
+  from the CI run); CI run: `<url>`.
+- Attached to this release (when published; see the release page): the ZIP,
+  `SHA256SUMS.windows.txt` and its `.asc`, the raw executables for direct
+  hashing, and this note. The source is the tagged commit.
+
 ## What this is
 
 A portable Windows package of `cachecoind.exe` and `cachecoin-cli.exe` from the
-tagged tree, with the PowerShell launcher, the documentation and the Tor Expert
-Bundle. The node is Tor-only; the launcher uses Tor on 9050/9150 and starts the
+tagged tree, with the PowerShell launcher, the window (`CacheCoin.exe` +
+`CacheCoin App.cmd` when built with `--gui-dir`), the documentation and the
+Tor Expert Bundle. The node is Tor-only; the launcher uses Tor on 9050/9150 and starts the
 bundled Tor if none is running. The data directory is `%APPDATA%\CacheCoin`, not
 `~/.cachecoin`.
 
@@ -70,6 +87,6 @@ bundled Tor if none is running. The data directory is `%APPDATA%\CacheCoin`, not
 
 ## Links
 
-- `START_HERE.md` (in `docs\`) for first steps.
+- `START_HERE.txt` (in `docs\`) for first steps.
 - `doc/build-windows.md` and `doc/release.md` in the repository for build and
   release details.
