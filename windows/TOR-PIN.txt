@@ -1,0 +1,21 @@
+Tor Expert Bundle pin
+=====================
+
+archive:  tor-expert-bundle-windows-x86_64-15.0.24.tar.gz
+url:      https://dist.torproject.org/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz
+sha256:   e9dc6ccc93cd6afa507193f4de284d6424233ff5102155cd2c94b259e8a22b65
+signed:   Tor Browser Developers (signing key) <torbrowser@torproject.org>
+key:      EF6E286DDA85EA2A4BA7DE684E2C6E8793298290
+
+tor version inside the bundle: 0.4.9.13 (git-3c575400909efe65)
+layout: the archive holds tor/ (tor.exe, tor-gencert.exe, pluggable_transports/),
+        data/ and docs/ at its root. The package stores all of them under tor/,
+        so tor/data/... and tor/docs/... in the package map to data/... and
+        docs/... in the archive.
+
+Verification: windows/verify_tor_bundle.sh --tor-dir <package tor dir>
+              [--tarball <downloaded .tar.gz>]
+It checks the archive sha256 against the value above (downloading it when no
+--tarball is given), then compares every file in the given directory with the
+archive contents, in both directions (missing files, mismatches and extras all
+fail). The directory may be the package's tor/ or an extracted bundle root.
