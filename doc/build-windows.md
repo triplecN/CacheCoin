@@ -174,7 +174,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps
 It rewrites only resources (no code, no consensus bytes) and must be followed by regenerating the
 package checksums and signature. The `--version` console banner still prints the upstream project
 strings; that text is compiled in, not a resource. CI applies this step to every Windows build
-before generating the package checksums (`.github/workflows/build.yml`).
+before generating the package checksums and asserts the rewritten VERSIONINFO is present
+(`.github/workflows/build.yml`).
 
 ## Reproducibility status
 

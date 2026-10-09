@@ -195,6 +195,23 @@ jobs:
         run: |
           pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoind.exe" -Icon assets\logo.ico -FileDescription "CacheCoin node (cachecoind)" -OriginalFilename "cachecoind.exe"
           pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoin-cli.exe" -Icon assets\logo.ico -FileDescription "CacheCoin RPC client (cachecoin-cli)" -OriginalFilename "cachecoin-cli.exe"
+      - name: Assert the brand rewriting took effect
+        # The step above must actually rewrite the VERSIONINFO resources. A
+        # green job with unbranded binaries is the failure this asserts
+        # against: the package advertises CacheCoin in Task Manager and
+        # Explorer, and a package that says so in PROVENANCE.txt must carry it.
+        shell: pwsh
+        run: |
+          $bad = @()
+          foreach ($name in @('cachecoind.exe','cachecoin-cli.exe')) {
+            $p = Join-Path "$env:GITHUB_WORKSPACE\release\bin" $name
+            $v = (Get-Item -LiteralPath $p).VersionInfo
+            if ($v.ProductName -ne 'CacheCoin' -or $v.FileDescription -notlike 'CacheCoin*') {
+              $bad += "$name ProductName='$($v.ProductName)' FileDescription='$($v.FileDescription)'"
+            }
+          }
+          if ($bad.Count -gt 0) { Write-Error ("branding missing: " + ($bad -join '; ')); exit 1 }
+          Write-Output "branding verified: CacheCoin VERSIONINFO on both node executables"
       - name: Assert static runtime and test the packaged folder with a clean PATH
         # Two checks the old job lacked:
         # 1. No imported DLL may exist in /mingw64/bin. The build links SQLite,

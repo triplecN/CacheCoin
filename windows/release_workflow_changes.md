@@ -123,10 +123,11 @@ file for the chosen release.
             mingw-w64-x86_64-zeromq python
       # Copy the "Clone pinned sources", "Apply CacheCoin patches in order",
       # "Build RandomX + node", "Rename the executables", "Brand the
-      # executables" and "Assert static runtime and test the packaged folder
-      # with a clean PATH" steps from build.yml verbatim. They produce
-      # release/bin with the branded, statically linked executables and
-      # SHA256SUMS.txt; nothing is stripped or collected separately.
+      # executables", "Assert the brand rewriting took effect" and "Assert
+      # static runtime and test the packaged folder with a clean PATH" steps
+      # from build.yml verbatim. They produce release/bin with the branded,
+      # statically linked executables and SHA256SUMS.txt; nothing is stripped
+      # or collected separately.
       - name: Fetch and verify the Tor Expert Bundle
         run: |
           curl -fsSLo tor.tar.gz "$TOR_EXPERT_URL"
