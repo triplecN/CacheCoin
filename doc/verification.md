@@ -29,7 +29,7 @@ hash can differ between build environments until reproducible builds exist.
   `d96aaa01ad58efd99120cee705971d5dab8f939a5e48d2a6072f52430b64fc70`
   (`cachecoind`, `--version` reports v31.1.0). A fresh build may differ.
 
-The full 13-suite run was at `ce3ea38`. After it, `tests/lwma_check.cpp` gained
+The 13-suite run at that time was on an earlier revision of the series. After it, `tests/lwma_check.cpp` gained
 the pulse-mining scenario, `tests/swap_scripts_regtest.py` was added,
 `patches/0016` fixed the PER payout sigop bound and the pool-drain order,
 `patches/0017` reordered header hashing, refused `-coinstatsindex` and fixed
@@ -165,7 +165,8 @@ bash tests/run_fuzz.sh "$B" 200000
 ## Verification boundaries
 
 - ARM64: the workflow exists; this record is x86-64. Windows `.exe` files are
-  built by CI and are outside these suites.
+  built by CI and are outside these suites; CI smoke-tests them in regtest, and
+  the release package has its own checks (`windows/README-Windows.txt`).
 - External audit, a second proof-of-work implementation, reproducible builds
   and a separate public test chain are outside this record.
 - Transaction and signature validation, chainstate corruption and power loss

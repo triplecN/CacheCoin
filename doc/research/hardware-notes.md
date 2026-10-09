@@ -66,7 +66,7 @@ At genesis the priority is a low barrier to entry on hardware people already own
 
 Many consumer laptops now ship with an on-die neural processing unit (NPU). Apple has had one since the M1 in 2020. Intel and AMD added NPUs to their laptop chips in 2023, and Intel Lunar Lake, AMD Strix Point and Qualcomm Snapdragon X Elite followed in 2024. The 2024 flagship parts advertise roughly 40-50 TOPS, older Meteor Lake and Hawk Point chips are under 20, and Apple M3/M4 sit around 18-38 TOPS. On a typical desktop the NPU is mostly idle, waiting for background OS tasks.
 
-CacheCoin sees this consumer AI silicon as a *possible* successor to pure CPU mining, if cross-vendor runtimes ever become stable and bit-exact enough for consensus. Today they are not.
+CacheCoin sees these consumer NPU accelerators as a *possible* successor to pure CPU mining, if cross-vendor runtimes ever become stable and bit-exact enough for consensus. Today they are not.
 
 ### 4.2 Technical guidelines for future maintainers
 

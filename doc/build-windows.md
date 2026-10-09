@@ -1,12 +1,13 @@
 # Building CacheCoin on native Windows
 
-Most people should not use this page. If you are on Windows, the supported path is
-[WSL2 Ubuntu](https://learn.microsoft.com/windows/wsl/install), and `scripts/build_linux.sh`
-works there unchanged. Read `START_HERE.md` first.
+Most people on Windows should use the native package from Releases
+([`README-Windows.txt`](../windows/README-Windows.txt)) instead of this page. To build the
+binaries yourself, [WSL2 Ubuntu](https://learn.microsoft.com/windows/wsl/install) runs
+`scripts/build_linux.sh` unchanged. Read `START_HERE.md` first.
 
 This page exists because `.github/workflows/build.yml` builds the Windows binaries in CI and
 someone has to be able to repeat it by hand. It reproduces that job. Validate it end to end on
-your machine; the resulting `.exe` is outside this repository's test suites.
+your machine; the resulting `.exe` stays outside the Linux regression suites (CI smoke-tests it in regtest).
 
 ## What you need
 
@@ -74,7 +75,7 @@ install a library or build extra executables into the CacheCoin output.
 ```bash
 mkdir -p /c/b/src/crypto/randomx/build
 cd /c/b/src/crypto/randomx/build
-cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
+cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
 cmake --build . -j4
 if ./randomx-tests > randomx-tests.log; then
   tail -1 randomx-tests.log
@@ -83,10 +84,22 @@ else
   echo "RandomX self-test FAILED. Do not build the node from this tree; fix RandomX first."
 fi
 cd /c/b
+# Link SQLite statically: hide the import library so CMake resolves
+# /mingw64/lib/libsqlite3.a instead of libsqlite3.dll.a. Without this the
+# package would have to carry libsqlite3-0.dll.
+if [ -f /mingw64/lib/libsqlite3.dll.a ]; then
+  mv /mingw64/lib/libsqlite3.dll.a /mingw64/lib/libsqlite3.dll.a.hidden
+fi
+# Sanitize the build: no absolute build paths in strings, no DWARF, no PE
+# timestamp. Replace <you> with your Windows user name (the flags for the
+# other paths are harmless when they do not match).
+MAPS="-ffile-prefix-map=C:/Users/<you>/msys64/mingw64/include= -ffile-prefix-map=/c/Users/<you>/msys64/mingw64/include= -ffile-prefix-map=C:/Users/<you>/msys64= -ffile-prefix-map=/c/Users/<you>/msys64= -ffile-prefix-map=C:/b=/b -ffile-prefix-map=/c/b=/b -fmacro-prefix-map=C:/Users/<you>/msys64/mingw64/include= -fmacro-prefix-map=/c/Users/<you>/msys64/mingw64/include= -fmacro-prefix-map=C:/Users/<you>/msys64= -fmacro-prefix-map=/c/Users/<you>/msys64= -fmacro-prefix-map=C:/b=/b -fmacro-prefix-map=/c/b=/b"
 cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
     -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI=OFF \
     -DBUILD_KERNEL_LIB=OFF -DENABLE_WALLET=ON -DENABLE_IPC=OFF \
-    -DWITH_ZMQ=OFF -DWITH_USDT=OFF -DBUILD_BITCOIN_BIN=OFF
+    -DWITH_ZMQ=OFF -DWITH_USDT=OFF -DBUILD_BITCOIN_BIN=OFF \
+    -DCMAKE_CXX_FLAGS="$MAPS" -DCMAKE_C_FLAGS="$MAPS" \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,-s -Wl,--no-insert-timestamp"
 cmake --build build -j4 --target bitcoind bitcoin-cli
 ```
 
@@ -103,22 +116,81 @@ should mention `cachecoin.conf` (an unpatched build says `bitcoin.conf`).
 mkdir -p /c/CacheCoin-bin
 cp /c/b/build/bin/bitcoind.exe   /c/CacheCoin-bin/cachecoind.exe
 cp /c/b/build/bin/bitcoin-cli.exe /c/CacheCoin-bin/cachecoin-cli.exe
-# Drop debug information: the MSYS2 Release build keeps DWARF by default and
-# the executables are otherwise hundreds of megabytes.
-strip --strip-all /c/CacheCoin-bin/cachecoind.exe /c/CacheCoin-bin/cachecoin-cli.exe
-# The MSYS2 build is dynamically linked. Copy the MinGW runtime and library
-# DLLs next to the executables so the folder runs on a machine without MSYS2;
-# Windows searches the application directory first. Only names that exist in
-# /mingw64/bin are copied, so system DLLs are never shipped.
-for exe in /c/CacheCoin-bin/cachecoind.exe /c/CacheCoin-bin/cachecoin-cli.exe; do
-  objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
-    if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" /c/CacheCoin-bin/; fi
-  done
-done
 cd /c/CacheCoin-bin
 ./cachecoind.exe --version
-sha256sum -- *.exe *.dll > SHA256SUMS.txt
+./cachecoin-cli.exe --version
+sha256sum -- *.exe > SHA256SUMS.txt
 ```
+
+The linker flags above already strip the executables (`-Wl,-s`) and omit the PE
+timestamp (`-Wl,--no-insert-timestamp`), so there is no separate `strip` step:
+the PE header time is 1970-01-01 and no build path appears in the strings.
+
+The build links SQLite, Boost, libevent and the MinGW runtime statically, so the
+folder must contain the two executables and nothing else. Prove it: no imported
+DLL may exist in `/mingw64/bin`.
+
+```bash
+for exe in /c/CacheCoin-bin/cachecoind.exe /c/CacheCoin-bin/cachecoin-cli.exe; do
+  imports="$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u)" || { echo "objdump failed on $exe"; exit 1; }
+  for dll in $imports; do
+    if [ -f "/mingw64/bin/$dll" ]; then echo "non-system import: $dll"; exit 1; fi
+  done
+done
+echo "no non-system imports"
+```
+
+Then run the folder the way a user will: with the MSYS2 path removed.
+
+```bash
+cd /c/CacheCoin-bin
+D="$(mktemp -d)"; DW="$(cygpath -w "$D")"; CP="/c/Windows/System32:/c/Windows"
+PATH="$CP" ./cachecoind.exe -regtest -datadir="$DW" -rpcuser=u -rpcpassword=p \
+    -rpcport=39932 -port=39933 -listen=0 -printtoconsole=0 &
+BPID=$!
+cli() { PATH="$CP" ./cachecoin-cli.exe -regtest -datadir="$DW" -rpcuser=u -rpcpassword=p -rpcport=39932 "$@"; }
+for i in $(seq 1 60); do cli getblockchaininfo >/dev/null 2>&1 && break; sleep 2; done
+cli createwallet w
+ADDR="$(cli -rpcwallet=w getnewaddress "" bech32)"
+cli -rpcwallet=w generatetoaddress 1 "$ADDR"
+test "$(cli getblockcount)" = "1" && echo "clean-environment wallet test OK"
+cli stop; wait $BPID || true; rm -rf "$D"
+```
+
+## Branding the executables (optional)
+
+A hand-built artifact still carries the upstream Bitcoin Core VERSIONINFO strings and no icon,
+so Task Manager shows "bitcoind (...)". Run the resource-only branding step after the build:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps1 `
+    -Exe <folder>\cachecoind.exe -Icon assets\logo.ico `
+    -FileDescription "CacheCoin node (cachecoind)" -OriginalFilename "cachecoind.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\brand_windows_exe.ps1 `
+    -Exe <folder>\cachecoin-cli.exe -Icon assets\logo.ico `
+    -FileDescription "CacheCoin RPC client (cachecoin-cli)" -OriginalFilename "cachecoin-cli.exe"
+```
+
+It rewrites only resources (no code, no consensus bytes) and must be followed by regenerating the
+package checksums and signature. The `--version` console banner still prints the upstream project
+strings; that text is compiled in, not a resource. CI applies this step to every Windows build
+before generating the package checksums (`.github/workflows/build.yml`).
+
+## Reproducibility status
+
+Bit-for-bit reproducibility is not implemented for `cachecoind` / `cachecoin-cli`: the same
+source and toolchain can produce different bytes (timestamps, paths, toolchain versions). The
+anchors that do not depend on the build are the patch fingerprint
+(`cat patches/*.patch | sha256sum`) and the applied tree id. Compare those when you rebuild;
+use the binary hash only to check a download in transit.
+
+The Windows GUI is deterministic: `build_det.ps1` (Windows) and `build.sh` (Linux/macOS) both
+compile with Roslyn `-deterministic`; two consecutive runs of `build_det.ps1` produced a
+byte-identical `CacheCoin.exe` for the packaged build.
+
+Every file in a released package is identified in `windows/PROVENANCE.txt`, and
+`Verify Download.cmd` checks a package in one step. CI builds the official binaries in
+`.github/workflows/build.yml`; a manual build should use the same flags as this page.
 
 ## Known limitations
 
@@ -133,11 +205,11 @@ sha256sum -- *.exe *.dll > SHA256SUMS.txt
   Both use `%APPDATA%\CacheCoin\.cookie` when `sys.platform == "win32"` (the Linux path
   is `~/.cachecoin/.cookie`). `CACHECOIN_RPC_COOKIE` still overrides it if the data
   directory is somewhere else.
-- **The binaries are dynamically linked.** They load the MinGW runtime and
-  library DLLs (`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll`,
-  `libevent-*.dll`, `libsqlite3-0.dll`, ...). Keep those DLLs next to the
-  executables; Windows searches the application directory first. The CI job
-  collects them with `objdump`; a hand-built folder needs the same step (section 5).
+- **The build is fully static.** `objdump -p` on the built executables lists
+  only Windows system DLLs; SQLite, Boost, libevent and the MinGW runtime are
+  linked in. The folder contains the two executables and nothing else. If a
+  rebuild ever imports a DLL that exists in `/mingw64/bin`, stop: the package
+  would have to ship and list that file (section 5 shows the assert).
 - **The binaries are unsigned.** Windows SmartScreen will show "Windows protected your PC" on
   first launch, and you have to choose More info, then Run anyway. That warning is expected for
   any unsigned build. Verify the SHA-256 against `SHA256SUMS.txt` before you do.
