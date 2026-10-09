@@ -1,7 +1,7 @@
 name: release
 
 # Triggered by a signed version tag. Builds the Linux binaries with
-# scripts/build_linux.sh, runs the 13 suites, writes SHA256SUMS.txt and creates
+# scripts/build_linux.sh, runs the 15 suites, writes SHA256SUMS.txt and creates
 # a DRAFT GitHub release. The maintainer then signs SHA256SUMS.txt offline with
 # the release GPG key, attaches the .asc, and publishes (see doc/release.md).
 # Signing does not happen in CI: the private key never leaves the maintainer.

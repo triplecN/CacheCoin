@@ -110,7 +110,7 @@ jobs:
     #
     # Required, like the Linux jobs: the Windows binaries are a release input,
     # and a red Windows job must fail the run. The artifact is only uploaded
-    # when the build, the regtest smoke test and the DLL collection all pass.
+    # when the build, the static-runtime assertion and the clean-PATH wallet test all pass.
     runs-on: windows-2022
     defaults:
       run:
@@ -159,68 +159,85 @@ jobs:
         run: |
           mkdir -p /c/b/src/crypto/randomx/build
           cd /c/b/src/crypto/randomx/build
-          cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release ..
+          cmake -DARCH=default -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
           cmake --build . -j4
           ./randomx-tests > randomx-tests.log && tail -1 randomx-tests.log
           cd /c/b
+          # Link SQLite statically: hide the import library so CMake resolves
+          # libsqlite3.a instead of libsqlite3.dll.a. The package must not carry
+          # libsqlite3-0.dll; the assert step below fails if any non-system
+          # dependency reappears.
+          if [ -f /mingw64/lib/libsqlite3.dll.a ]; then
+            mv /mingw64/lib/libsqlite3.dll.a /mingw64/lib/libsqlite3.dll.a.hidden
+          fi
+          # Sanitize the build: remove absolute build paths from strings, strip
+          # the executables and omit the PE timestamp (both set 1970-01-01).
+          MAPS="-ffile-prefix-map=C:/msys64/mingw64/include= -ffile-prefix-map=/mingw64/include= -ffile-prefix-map=C:/b=/b -ffile-prefix-map=/c/b=/b -fmacro-prefix-map=C:/msys64/mingw64/include= -fmacro-prefix-map=/mingw64/include= -fmacro-prefix-map=C:/b=/b -fmacro-prefix-map=/c/b=/b"
           cmake -B build -DCACHECOIN_RANDOMX_ROOT=/c/b/src/crypto/randomx \
             -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DBUILD_GUI=OFF \
             -DBUILD_KERNEL_LIB=OFF -DBUILD_BITCOIN_BIN=OFF -DENABLE_WALLET=ON \
-            -DENABLE_IPC=OFF -DWITH_ZMQ=OFF -DWITH_USDT=OFF
+            -DENABLE_IPC=OFF -DWITH_ZMQ=OFF -DWITH_USDT=OFF \
+            -DCMAKE_CXX_FLAGS="$MAPS" -DCMAKE_C_FLAGS="$MAPS" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-s -Wl,--no-insert-timestamp"
           cmake --build build -j4 --target bitcoind bitcoin-cli
-      - name: Smoke test (start the node, mine a regtest block)
-        # The Linux suites cannot run these binaries, so this is the only
-        # automated check that the Windows build starts, passes the RandomX
-        # self-test, reports the CacheCoin genesis and can mine. Regtest only:
-        # no network, no mainnet, throw-away datadir.
-        run: |
-          cd /c/b
-          ./build/bin/bitcoind.exe --version
-          D="$(mktemp -d)"
-          CLI="./build/bin/bitcoin-cli.exe -regtest -datadir=$D -rpcuser=u -rpcpassword=p -rpcport=39932"
-          ./build/bin/bitcoind.exe -regtest -datadir="$D" -rpcuser=u -rpcpassword=p \
-              -rpcport=39932 -port=39933 -listen=0 -printtoconsole=0 &
-          BPID=$!
-          for i in $(seq 1 60); do
-            $CLI getblockchaininfo >/dev/null 2>&1 && break
-            sleep 2
-          done
-          GENESIS="$($CLI getblockhash 0)"
-          echo "genesis: $GENESIS"
-          # Regtest keeps Bitcoin's regtest genesis (patch 0002 only replaces the
-          # mainnet one); 1bc3387d... is the mainnet genesis, checked elsewhere.
-          test "$GENESIS" = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-          $CLI createwallet w
-          ADDR="$($CLI -rpcwallet=w getnewaddress "" bech32)"
-          $CLI -rpcwallet=w generatetoaddress 1 "$ADDR"
-          H="$($CLI getblockcount)"
-          echo "regtest height: $H"
-          test "$H" = "1"
-          $CLI stop
-          wait $BPID || true
-          rm -rf "$D"
-      - name: Rename, collect runtime DLLs, checksum, upload
-        # The MSYS2/MINGW64 build is dynamically linked, so the artifact carries
-        # the MinGW runtime and library DLLs next to the executables. Windows
-        # searches the application directory first, so the package runs on a
-        # machine that has never seen MSYS2. objdump lists the imported DLLs
-        # (ldd is not installed in this environment); only names that exist in
-        # /mingw64/bin are copied, so system DLLs are never shipped.
+      - name: Rename the executables
         run: |
           BIN="$GITHUB_WORKSPACE/release/bin"
           mkdir -p "$BIN"
           cp /c/b/build/bin/bitcoind.exe "$BIN/cachecoind.exe"
           cp /c/b/build/bin/bitcoin-cli.exe "$BIN/cachecoin-cli.exe"
-          strip --strip-all "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"
-          for exe in "$BIN/cachecoind.exe" "$BIN/cachecoin-cli.exe"; do
-            objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u | while read -r dll; do
-              if [ -f "/mingw64/bin/$dll" ]; then cp "/mingw64/bin/$dll" "$BIN/"; fi
+          ls -la "$BIN"
+      - name: Brand the executables (CacheCoin name + logo)
+        # Resource-only: Task Manager shows CacheCoin instead of the upstream Bitcoin Core
+        # strings. This does not touch code or consensus bytes; the patch fingerprint is
+        # unchanged. The binaries are already stripped and timestamp-neutral (linker flags).
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoind.exe" -Icon assets\logo.ico -FileDescription "CacheCoin node (cachecoind)" -OriginalFilename "cachecoind.exe"
+          pwsh -NoProfile -File scripts/brand_windows_exe.ps1 -Exe "$env:GITHUB_WORKSPACE\release\bin\cachecoin-cli.exe" -Icon assets\logo.ico -FileDescription "CacheCoin RPC client (cachecoin-cli)" -OriginalFilename "cachecoin-cli.exe"
+      - name: Assert static runtime and test the packaged folder with a clean PATH
+        # Two checks the old job lacked:
+        # 1. No imported DLL may exist in /mingw64/bin. The build links SQLite,
+        #    Boost, libevent and the MinGW runtime statically; if any becomes
+        #    dynamic again, this fails instead of shipping an unlisted DLL.
+        # 2. Run the executables from the packaged folder with the MSYS2 path
+        #    removed, create a wallet and mine a regtest block. This is the only
+        #    check that proves the folder works on a machine without MSYS2.
+        run: |
+          BIN="$GITHUB_WORKSPACE/release/bin"
+          cd "$BIN"
+          for exe in cachecoind.exe cachecoin-cli.exe; do
+            imports="$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}' | sort -u)" || { echo "objdump failed on $exe"; exit 1; }
+            for dll in $imports; do
+              if [ -f "/mingw64/bin/$dll" ]; then echo "non-system import in $exe: $dll"; exit 1; fi
             done
           done
-          cd "$BIN"
+          echo "no non-system DLL imports"
           ./cachecoind.exe --version
           ./cachecoin-cli.exe --version
-          sha256sum -- *.exe *.dll > SHA256SUMS.txt
+          D="$(mktemp -d)"
+          DW="$(cygpath -w "$D")"
+          CP="/c/Windows/System32:/c/Windows"
+          PATH="$CP" ./cachecoind.exe -regtest -datadir="$DW" -rpcuser=u -rpcpassword=p \
+              -rpcport=39932 -port=39933 -listen=0 -printtoconsole=0 &
+          BPID=$!
+          cli() { PATH="$CP" ./cachecoin-cli.exe -regtest -datadir="$DW" -rpcuser=u -rpcpassword=p -rpcport=39932 "$@"; }
+          for i in $(seq 1 60); do cli getblockchaininfo >/dev/null 2>&1 && break; sleep 2; done
+          GENESIS="$(cli getblockhash 0)"
+          echo "genesis: $GENESIS"
+          # Regtest keeps Bitcoin's regtest genesis (patch 0002 only replaces the
+          # mainnet one); 1bc3387d... is the mainnet genesis, checked elsewhere.
+          test "$GENESIS" = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+          cli createwallet w
+          ADDR="$(cli -rpcwallet=w getnewaddress "" bech32)"
+          cli -rpcwallet=w generatetoaddress 1 "$ADDR"
+          H="$(cli getblockcount)"
+          echo "regtest height: $H"
+          test "$H" = "1"
+          cli stop
+          wait $BPID || true
+          rm -rf "$D"
+          sha256sum -- *.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
