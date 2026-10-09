@@ -30,7 +30,7 @@ Started by [triplecN](https://github.com/triplecN). CacheCoin is open-source sof
 
 The node (`cachecoind`) is Bitcoin Core v31.1 with the CacheCoin changes in [`patches/`](patches/), and RandomX does the proof-of-work. If you know Bitcoin Core, most of this codebase will look familiar.
 
-> **Running a node:** see [`deploy/README.md`](deploy/README.md) for a Tor-only VPS seed node and a home mining node that connects to it. On Windows, WSL2 Ubuntu is the supported path. Tor has to be running before the node connects to anything, and the port has to match: the shipped config asks for `127.0.0.1:9050`, which is the Tor Expert Bundle and system-daemon port, while Tor Browser listens on `9150`. New to all this? Start with [`START_HERE.md`](START_HERE.md).
+> **Running a node:** see [`deploy/README.md`](deploy/README.md) for a Tor-only VPS seed node and a home mining node that connects to it. On Windows, the easiest path is the release package: `CacheCoin-Windows-<version>.zip` (see [`windows/README-Windows.txt`](windows/README-Windows.txt)) verified with `version.json` + `SHA256SUMS.windows.txt` and its GPG signature; WSL2 Ubuntu (or the MSYS2 steps in [`doc/build-windows.md`](doc/build-windows.md)) remains the path for building from source. Tor has to be running before the node connects to anything, and the port has to match: the shipped config asks for `127.0.0.1:9050`, which is the Tor Expert Bundle and system-daemon port, while Tor Browser listens on `9150`. New to all this? Start with [`START_HERE.md`](START_HERE.md).
 
 ---
 
@@ -134,8 +134,8 @@ This is transport and economics only. It does not change the proof-of-work or th
 | Chain growth | Follows actual use. If every block were full, up to about 2.9 GB per day (about 1 TB per year). |
 | Coinbase maturity | 100 blocks |
 | Max future block time | 10 minutes |
-| Data directory | `~/.cachecoin` (config `cachecoin.conf`) |
-| Seeds | No DNS seeds and no fixed seeds are compiled in. Community seed: `ag7rydtma6dt5fonz76sdbecrbugq3uln7cc6ddvg2c2jngio4lw6mid.onion:29333` (`addnode=` or `-seednode`, with `proxy=127.0.0.1:9050` and `onlynet=onion`). |
+| Data directory | Linux: `~/.cachecoin` (config `cachecoin.conf`); Windows package: `%APPDATA%\CacheCoin` |
+| Seeds | No DNS seeds and no fixed seeds are compiled in. Community seeds: `ag7rydtma6dt5fonz76sdbecrbugq3uln7cc6ddvg2c2jngio4lw6mid.onion:29333` and `7uodchunfsykltytzwhpq6plvlxsulhtawjisrvcxzhljfdsmwnjbead.onion:29333` (`addnode=` or `-seednode`, with `proxy=127.0.0.1:9050` and `onlynet=onion`). |
 
 Addresses and keys from `scripts/keygen.py` work with the node (same HRP, prefixes and WIF version). The node's wallets are descriptor wallets. Import a key with `importdescriptors` (see the header of `keygen.py`).
 
@@ -228,8 +228,10 @@ Cachecoin/
 ├── doc/economics.md          # Emission schedule, PER reservoir mechanics, ticket math
 ├── doc/mining.md             # Mining practically: expectations, tools, hygiene
 ├── doc/wallet.md             # Create, back up, spend and restore a wallet
+├── doc/build-windows.md      # Building the Windows .exe files by hand (MSYS2)
 ├── doc/research/hardware-notes.md # Speculative hardware research notes (not a roadmap)
 ├── explorer/                 # Block explorer (Python standard library + static HTML)
+├── windows/                  # Native Windows package: launcher, docs, build_package.sh (window via --gui-dir)
 ├── tests/
 │   ├── functional_regtest.py # Multi-node regtest: sync, subsidy, fee split, re-org limit, time rules
 │   ├── p2p_dos_regtest.py    # Raw P2P client: replayed headers/blocks are cheap, bad PoW is punished
@@ -266,7 +268,7 @@ bash scripts/build_linux.sh
 
 The script installs the build dependencies, fetches Bitcoin Core `v31.1` (checked against its commit hash) and RandomX at the pinned commit, applies `patches/*.patch`, builds a portable `cachecoind` and `cachecoin-cli` (no `-march=native`), and installs them to `/usr/local/bin`. It is safe to re-run.
 
-On Windows, WSL2 Ubuntu is the supported path and the commands are the same. There is no native Windows build script, and nothing in this repository tests the `.exe` files that CI produces. See [`doc/build-windows.md`](doc/build-windows.md) to build them yourself.
+On Windows, most people should use the native package built by [`windows/build_package.sh`](windows/build_package.sh) from the CI `.exe` files (see [`windows/README-Windows.txt`](windows/README-Windows.txt)). CI smoke-tests the `.exe` files in regtest; they remain outside the Linux regression suites. WSL2 Ubuntu or the MSYS2 steps in [`doc/build-windows.md`](doc/build-windows.md) are for building the binaries yourself.
 
 Run the tests against the fresh build. They use throwaway data directories and never mine on mainnet:
 
@@ -307,7 +309,7 @@ cachecoind -daemon
 cachecoin-cli getblockchaininfo
 ```
 
-On Windows these commands run inside WSL2, so your `~/.cachecoin` lives on the Linux side. The typical setup is two machines: a Tor-only VPS seed that stays online, and a home miner behind Tor that connects to it.
+On Windows these commands run inside WSL2, so your `~/.cachecoin` lives on the Linux side (the native Windows package instead uses `%APPDATA%\CacheCoin` and needs no WSL). The typical setup is two machines: a Tor-only VPS seed that stays online, and a home miner behind Tor that connects to it.
 
 Two inherited Bitcoin Core defaults assume 10-minute blocks and are adjusted in the shipped config. First, the fee estimator's horizons are counted in blocks, so `estimatesmartfee 6` means about 6 minutes here, not about an hour. Second, the mempool holds about five times as many blocks per hour, so `config/cachecoin.conf` lowers `maxmempool` and `deploy/` lowers `dbcache` from the upstream defaults. Mempool expiry stays at the inherited 336 hours (14 days) on both chains: it is wall-clock, not block-based, so it does not need adjusting. If you write your own config instead of copying the shipped one, re-check those values and expect a slower initial sync. There is no `assumevalid` shortcut, so every block from genesis is fully validated.
 

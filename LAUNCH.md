@@ -25,13 +25,14 @@ cachecoin-cli getblockhash 1     # and 2, 3, 4, 5
 
 ```
 addnode=ag7rydtma6dt5fonz76sdbecrbugq3uln7cc6ddvg2c2jngio4lw6mid.onion:29333
+addnode=7uodchunfsykltytzwhpq6plvlxsulhtawjisrvcxzhljfdsmwnjbead.onion:29333
 ```
 
-Together with `proxy=127.0.0.1:9050` and `onlynet=onion`, this is how a new node reaches the network. The seed is a relay only; it does not mine. It is the same seed listed in `README.md` section 2; if the two ever disagree, the README is authoritative. `getconnectioncount` at 1 or more is the only in-repo check that the seed is reachable; the block hashes are the check that it served the right chain.
+Together with `proxy=127.0.0.1:9050` and `onlynet=onion`, these are how a new node reaches the network. Both seeds are relays only; they do not mine. They are the same seeds listed in `README.md` section 2; if the two ever disagree, the README is authoritative. `getconnectioncount` at 1 or more is the only in-repo check that a seed is reachable; the block hashes are the check that it served the right chain.
 
 ## How to join and verify
 
-1. Build from source: `bash scripts/build_linux.sh` (Ubuntu/WSL2), or see `doc/build-windows.md`.
+1. Build from source: `bash scripts/build_linux.sh` (Ubuntu/WSL2), use the Windows release package (`windows/README-Windows.txt`), or see `doc/build-windows.md`.
 2. Set `proxy=127.0.0.1:9050`, `onlynet=onion` and the `addnode=` line above in `cachecoin.conf`.
 3. Start `cachecoind`, check `cachecoin-cli getconnectioncount` is at least 1, then `getblockchaininfo`.
 4. Compare each hash above (including the genesis row) with `getblockhash <height>`. `getblockhash` returns the SHA256d block id; the RandomX proof-of-work digest is a separate value (README section 1.1).
