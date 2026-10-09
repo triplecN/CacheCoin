@@ -5,12 +5,13 @@
 #
 # Usage:  bash deploy/home/mine.sh <payout-address> [parallel-miners]
 #   payout-address   your own cccn1... address (never let a tool invent one)
-#   parallel-miners  RPC mining loops to run at once (default 1); keep it below
-#                    rpcthreads (8 in deploy/home/cachecoin.conf)
+#   parallel-miners  RPC mining loops to run at once (default 1, maximum 7);
+#                    keep it below rpcthreads (8 in deploy/home/cachecoin.conf)
 #
 # Safety checks before mining:
 #   - node is on mainnet and the address is valid
-#   - node has at least one peer (your VPS), so mined blocks are actually relayed
+#   - node has at least one peer (a seed or another node), so mined blocks are
+#     actually relayed
 # Each call tries a limited number of nonces and then takes a fresh template, so a
 # miner never keeps working on a tip that another block has already replaced.
 # ==============================================================================
@@ -18,8 +19,8 @@ set -euo pipefail
 
 ADDR="${1:-}"
 PARALLEL="${2:-1}"
-if ! [[ "${PARALLEL}" =~ ^[1-9][0-9]*$ ]] || [ "${PARALLEL}" -gt 8 ]; then
-    echo "usage: $0 <payout-address> [parallel-miners 1-8]"
+if ! [[ "${PARALLEL}" =~ ^[1-9][0-9]*$ ]] || [ "${PARALLEL}" -ge 8 ]; then
+    echo "usage: $0 <payout-address> [parallel-miners 1-7]"
     exit 1
 fi
 TRIES_PER_CALL=500   # ~10-15 s of light-mode RandomX on one core
@@ -48,9 +49,9 @@ peer_count() {
     echo "${n}"
 }
 if ! n=$(peer_count) || [ "${n}" -lt 1 ]; then
-    echo "[!] No peers. The node is not connected to your VPS yet (check Tor and the"
-    echo "    connect= line in ~/.cachecoin/cachecoin.conf). Refusing to mine blocks"
-    echo "    that nobody else would receive."
+    echo "[!] No peers. The node is not connected yet (check Tor and the addnode= line"
+    echo "    in ~/.cachecoin/cachecoin.conf). Refusing to mine blocks that nobody"
+    echo "    else would receive."
     exit 1
 fi
 
@@ -67,15 +68,16 @@ trap cleanup INT TERM
 mine_loop() {
     local id="$1"
     while true; do
-        # Pause while the node has no peer (VPS or Tor down): blocks mined alone would
+        # Pause while the node has no peer (seed or Tor down): blocks mined alone would
         # only start a private branch that the rest of the network has to reconcile.
         if ! n=$(peer_count) || [ "${n}" -lt 1 ]; then
             sleep 15
             continue
         fi
-        # Clock guard: if the best block's timestamp is in the future (local clock
-        # behind), every mined block is rejected as time-too-new and the work is
-        # wasted. One-sided check, five-minute tolerance, never blocks a synced node.
+        # Clock guard: if the best block's timestamp is ahead of this machine's clock
+        # (local clock behind), a new block's timestamp can fall below the network's
+        # median time and be rejected as time-too-old. One-sided check, five-minute
+        # tolerance, never blocks a synced node.
         best="$("${CLI[@]}" getbestblockhash 2>/dev/null)" || { sleep 5; continue; }
         tip_time="$("${CLI[@]}" getblockheader "${best}" 2>/dev/null | sed -n 's/.*"time": \([0-9][0-9]*\).*/\1/p')"
         now_epoch="$(date +%s)"

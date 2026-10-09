@@ -5,8 +5,8 @@
  ┌──────────────────────────────┐   Tor only   ┌──────────────────────────────┐   Tor   ┌───────────┐
  │ cachecoind  (mining node)    │ ───────────► │ cachecoind  (seed / relay)   │ ◄──────►│ anyone    │
  │  onlynet=onion               │  connect=    │  onlynet=onion               │         │ running a │
- │  connect=<vps>.onion:29333   │  <vps>.onion │  listenonion=1  -> xxx.onion │         │ node      │
- │  listen=0 (no inbound)       │              │  binds 127.0.0.1 only        │         └───────────┘
+ │  addnode=<seed>.onion:29333   │  <vps>.onion │  listenonion=1  -> xxx.onion │         │ node      │
+ │  listenonion=1 -> yyy.onion       │              │  binds 127.0.0.1 only        │         └───────────┘
  │ deploy/home/mine.sh          │              │  no mining, no open ports    │
  │  -> generatetoaddress        │              │  systemd: cachecoind.service │
  └──────────────────────────────┘              └──────────────────────────────┘
@@ -16,9 +16,11 @@
   (most VPS providers forbid mining). It is reachable only through its `.onion`
   address, and under correct Tor-only configuration its IP address is not used for
   peer-to-peer traffic (misconfiguration can still leak it — verify onlynet/proxy).
-* **Home PC**: mines. It connects to exactly one peer, your VPS, through Tor, and
-  accepts no incoming connections. Under correct configuration other nodes only ever
-  see blocks coming from the VPS onion service, not your home IP.
+* **Home PC**: mines and also serves as a peer. It bootstraps from the published
+  seed (`addnode=`) through Tor and accepts incoming Tor connections, so other
+  nodes can sync from it. Tor hides the home IP; the node's own `.onion` address
+  is public, like any peer. Connection count and daily upload are capped
+  (`maxconnections=32`, `maxuploadtarget=5000`).
 
 Ports: P2P `29333`, RPC `29332` (local only), Tor onion target `29334` (local only).
 
@@ -62,7 +64,7 @@ Back up `/var/lib/cachecoind/onion_v3_private_key`. With it the same onion
 address can be restored on any new VPS; without it the address is lost for good.
 
 There are no DNS seeds, so other people can only join if they know a node. To let
-them, the current seed is published in the README (`Seeds` row); they add
+them, the current seeds are published in the README (`Seeds` row); they add
 `addnode=<address>.onion:29333` to their `cachecoin.conf`, together with
 `proxy=127.0.0.1:9050` and `onlynet=onion`.
 
@@ -88,16 +90,38 @@ journalctl -u cachecoind -n 50      # the log (journald caps its size; there is 
 The first log lines show the RandomX mode and the self-test result, for example
 `RandomX proof-of-work: JIT (W^X), self-test passed`.
 
-## 3. Home PC: mining node behind Tor
+## 3. Home PC: node + peer + miner behind Tor
+
+The home node is the whole package in one process: it mines and it also serves
+other nodes (it publishes its own onion service and accepts incoming Tor
+connections). Connection count and daily upload are capped in the config.
+
+On Windows, the native package (`windows/README-Windows.txt`) runs this same
+node+peer+miner setup without WSL, systemd or a manual Tor install.
 
 ```bash
 sudo apt-get install -y tor
-sudo service tor start
+# Let the node create its onion service through Tor's control port. The cookie
+# must be group-readable for the user that runs cachecoind. The marker makes a
+# re-run safe: the lines are appended only once.
+if ! grep -q "CacheCoin home: lines appended" /etc/tor/torrc; then
+sudo tee -a /etc/tor/torrc >/dev/null <<'EOF'
+
+# CacheCoin home: lines appended by deploy/README.md section 3
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+EOF
+fi
+sudo systemctl restart tor
+sudo usermod -aG debian-tor "$USER"     # log out and back in once, so the group applies
 mkdir -p ~/.cachecoin
 cp deploy/home/cachecoin.conf ~/.cachecoin/cachecoin.conf
-nano ~/.cachecoin/cachecoin.conf        # set connect=<your VPS onion>:29333
+# The shipped addnode= seeds are already in the file; add more as the network grows.
 cachecoind -daemon
-cachecoin-cli -rpcwait getconnectioncount   # must become 1 (the VPS)
+cachecoin-cli -rpcwait getconnectioncount   # 1 or more (a seed, or other peers)
+# After a minute, the node's own onion address appears here:
+cachecoin-cli getnetworkinfo | grep -A8 localaddresses
 ```
 
 **Keep the clock right.** A node rejects blocks stamped more than 10 minutes
@@ -123,7 +147,9 @@ with gentler ban treatment:
    ```
 2. Add `whitebind=noban@127.0.0.1:29335` to `/etc/cachecoin/cachecoin.conf` and
    run `sudo systemctl restart cachecoind`.
-3. On the home PC, use `connect=<that address>:29333` instead of the public one.
+3. On the home PC, replace the `addnode=` seed with
+   `connect=<that address>:29333`. `connect=` uses only the addresses listed
+   there and disables the other peers, so this step is optional.
 
 Keep that address to yourself: connections via this unpublished entrance are exempt
 from automatic banning (noban) — use it only for your own miner, monitor it, and
@@ -141,7 +167,7 @@ unreachable it pauses and resumes by itself. Blocks 1-60 are mined at the minimu
 difficulty; after that LWMA adjusts difficulty every block toward one block per
 60 seconds.
 
-Until block 1 exists, `getblockchaininfo` shows `"initialblockdownload": true`:
+On a brand-new chain (before block 1), `getblockchaininfo` shows `"initialblockdownload": true`:
 the genesis block is more than 24 hours old, so the node assumes it is still
 catching up. That is expected and does not stop the built-in miner; it changes to
 `false` once a block with a current timestamp is mined. Mine the first blocks with
@@ -190,9 +216,14 @@ The payment is handed to other nodes over one-shot Tor connections (see
 [SHUNKO_PROTOCOL.md](../SHUNKO_PROTOCOL.md)) and shows up in your wallet once it
 is mined. Ask every payer for a new address, and give a new one each time.
 
+While this home node listens, the automatic hand-over still excludes connected
+peers and every node listed with `addnode=`, but an inbound peer cannot be matched
+by address. If that matters to you, name the targets you trust explicitly
+(SHUNKO_PROTOCOL.md section 4) instead of relying on the automatic path.
+
 ## If the network splits
 
-With one seed node, an outage can leave miners on different branches for a while.
+With few independent nodes, an outage can leave miners on different branches for a while.
 When they reconnect, a node refuses a branch that would undo more than 5 of its
 blocks (see the main README) and `getblockchaininfo` shows a warning. The split
 heals by itself once one branch is 36 blocks past the point where the two diverged, counted in height rather than in work. To end it at once on

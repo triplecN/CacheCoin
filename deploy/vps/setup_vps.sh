@@ -148,7 +148,7 @@ echo "[6/6] Waiting for the onion address (Tor can take a minute)"
 CLI=(sudo -u cachecoin /usr/local/bin/cachecoin-cli -datadir="${DATADIR}" -conf="${CONF}")
 ONION=""
 for _ in $(seq 1 60); do
-    ONION="$(printf '%s' "$("${CLI[@]}" getnetworkinfo 2>/dev/null)" | python3 -c 'import sys,json; infos=json.load(sys.stdin).get("local_addresses",[]); print(next((a["address"] for a in infos if a.get("address","").endswith(".onion")), ""))' 2>/dev/null || true)"
+    ONION="$(printf '%s' "$("${CLI[@]}" getnetworkinfo 2>/dev/null)" | python3 -c 'import sys,json; infos=json.load(sys.stdin).get("localaddresses",[]); print(next((a["address"] for a in infos if a.get("address","").endswith(".onion")), ""))' 2>/dev/null || true)"
     [ -n "${ONION}" ] && break
     sleep 5
 done
@@ -158,7 +158,7 @@ if [ -n "${ONION}" ]; then
     echo "=============================================================================="
     echo " CacheCoin seed node is running"
     echo "   onion address : ${ONION}:29333"
-    echo "   use it in the home miner config:  connect=${ONION}:29333"
+    echo "   use it in the home miner config:  addnode=${ONION}:29333"
     echo "   others join with:                 addnode=${ONION}:29333"
     echo
     echo " BACK UP this file to keep the same onion address after a reinstall:"
