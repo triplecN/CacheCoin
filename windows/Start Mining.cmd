@@ -1,3 +1,4 @@
 @echo off
 setlocal
-call "%~dp0CacheCoin.cmd" -Mode mining
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launcher\CacheCoin.ps1" -Mode mining %*
+exit /b %ERRORLEVEL%
