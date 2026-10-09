@@ -30,6 +30,7 @@ dist/
 
 # Logs & temp
 *.log
+*.tmp
 tmp/
 temp/
 
@@ -60,6 +61,9 @@ wallet.dat
 # Keys and Tor state that must never be committed
 *.pem
 *.key
+*.gpg
+*.sec
+secring.*
 *.onion
 hostname
 *.swp
@@ -68,6 +72,7 @@ hostname
 release/
 SHA256SUMS.txt
 SHA256SUMS.txt.asc
+CacheCoin-Windows-*.zip
 
 # Local build state
 .cachecoin-patches
@@ -85,3 +90,11 @@ node_modules/
 # Environment files
 .env
 *.env
+
+# Windows package artifacts merged into windows/ (built copies; never commit binaries or keys)
+windows/tor/
+windows/version.json
+windows/SHA256SUMS.windows.txt
+windows/SHA256SUMS.windows.txt.asc
+windows/Wallet/
+windows/LICENSE
